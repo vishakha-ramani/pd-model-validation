@@ -1,0 +1,11 @@
+{
+  "max_num_batched_tokens": 8192,
+  "chunked_prefill_enabled": true,
+  "async_scheduling": false,
+  "max_num_partial_prefills": 1,
+  "long_prefill_token_threshold": 0,
+  "max_model_len": 131072,
+  "num_gpu_blocks": 29334,
+  "model": "meta-llama/Llama-3.3-70B-Instruct",
+  "tensor_parallel_size": 4
+}

@@ -1,0 +1,19 @@
+# calibration/deploy/extractor.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cal-extractor
+  namespace: vramani-perfcal
+spec:
+  restartPolicy: Never
+  containers:
+  - name: extractor
+    image: busybox:latest
+    command: ["sleep", "3600"]
+    volumeMounts:
+    - name: results
+      mountPath: /mnt/pvc
+  volumes:
+  - name: results
+    persistentVolumeClaim:
+      claimName: cal-results-pvc

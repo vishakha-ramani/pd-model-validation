@@ -1,0 +1,91 @@
+# calibration/deploy/guidellm-overload-admission-job.yaml
+# Fixed-rate overload extension for the admission-validation sweep. Runs
+# after guidellm-sweep-admission-job.yaml, against the SAME already-running
+# vllm-cal deployment, so the admission hook's trajectory.jsonl and
+# admission_events.jsonl accumulate continuously across sweep and overload.
+# Single archetype (decode-corner, ISL 256 / OSL 512, the archetype with the
+# deepest admission queueing), --profile constant (not sweep), at a FIXED
+# rate the operator sets ABOVE the sweep's observed peak throughput for this
+# archetype, so a standing waiting-queue backlog forms. GUIDELLM_RATE is a
+# placeholder (__GUIDELLM_RATE__) substituted by calibration/admission/run_sweep.sh
+# from the OVERLOAD_RATE environment variable. GUIDELLM_MAX_SECONDS is longer
+# than the Mode-B/admission sweep's 180s so the backlog has time to build and
+# sustain past queue saturation.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: guidellm-overload-admission
+  namespace: vramani-perfcal
+  labels:
+    experiment: cal-validate-70b
+spec:
+  template:
+    metadata:
+      labels:
+        experiment: cal-validate-70b
+    spec:
+      # co-locate the client on the vLLM node (RTT ~= 0), same as the sweep Job
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: vllm-cal
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - name: guidellm-overload-70b
+        image: ghcr.io/vllm-project/guidellm:v0.5.4
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            mkdir -p "$GUIDELLM_OUTPUT_DIR"
+            guidellm benchmark run \
+              --target "$GUIDELLM_TARGET" \
+              --profile "$GUIDELLM_PROFILE" \
+              --rate "$GUIDELLM_RATE" \
+              --max-seconds "$GUIDELLM_MAX_SECONDS" \
+              --data "$GUIDELLM_DATA" \
+              --request-type text_completions \
+              --output-dir "$GUIDELLM_OUTPUT_DIR" \
+              --outputs "$GUIDELLM_OUTPUTS"
+        env:
+        - name: HF_HOME
+          value: "/tmp"
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token-secret
+              key: token
+        - name: GUIDELLM_TARGET
+          value: "http://vllm-cal:8000"
+        - name: GUIDELLM_PROFILE
+          value: "constant"
+        # placeholder substituted by calibration/admission/run_sweep.sh from
+        # the OVERLOAD_RATE environment variable (requests/sec, ABOVE the
+        # sweep's observed peak for decode-corner)
+        - name: GUIDELLM_RATE
+          value: "__GUIDELLM_RATE__"
+        - name: GUIDELLM_MAX_SECONDS
+          value: "300"
+        - name: GUIDELLM_DATA
+          value: "prompt_tokens=256,prompt_tokens_min=256,prompt_tokens_max=256,output_tokens=512,output_tokens_min=512,output_tokens_max=512,random_seed=0"
+        - name: GUIDELLM_OUTPUT_DIR
+          value: "/results/guidellm-admission/overload-decode-corner-i256-o512"
+        - name: GUIDELLM_OUTPUTS
+          value: "csv,json"
+        volumeMounts:
+        - name: results
+          mountPath: "/results"
+      # standard GPU-node toleration only (client requests no GPU); NOT the
+      # llm-d-benchmark-harness taint.
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      restartPolicy: Never
+      volumes:
+      - name: results
+        persistentVolumeClaim:
+          claimName: cal-results-pvc
+  backoffLimit: 2

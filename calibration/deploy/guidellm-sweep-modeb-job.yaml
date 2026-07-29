@@ -1,0 +1,79 @@
+# calibration/deploy/guidellm-sweep-modeb-job.yaml
+# Mode-B variant of guidellm-sweep-job.yaml: same open-loop rate sweep against the
+# calibrated 70B, but GUIDELLM_DATA and GUIDELLM_OUTPUT_DIR are placeholders
+# (__GUIDELLM_DATA__ / __GUIDELLM_OUTPUT_DIR__) substituted per archetype by
+# calibration/modeb/run_sweep.sh. Token lengths stay PINNED (min=max) per archetype
+# so each run is deterministic and replayable into the EDPP rollforward.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: guidellm-sweep-modeb
+  namespace: vramani-perfcal
+  labels:
+    experiment: cal-validate-70b
+spec:
+  template:
+    metadata:
+      labels:
+        experiment: cal-validate-70b
+    spec:
+      # co-locate the client on the vLLM node (RTT ~= 0), same as the calibrate Job
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: vllm-cal
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - name: guidellm-sweep-70b
+        image: ghcr.io/vllm-project/guidellm:v0.5.4
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            mkdir -p "$GUIDELLM_OUTPUT_DIR"
+            guidellm benchmark run \
+              --target "$GUIDELLM_TARGET" \
+              --profile "$GUIDELLM_PROFILE" \
+              --max-seconds "$GUIDELLM_MAX_SECONDS" \
+              --data "$GUIDELLM_DATA" \
+              --request-type text_completions \
+              --output-dir "$GUIDELLM_OUTPUT_DIR" \
+              --outputs "$GUIDELLM_OUTPUTS"
+        env:
+        - name: HF_HOME
+          value: "/tmp"
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token-secret
+              key: token
+        - name: GUIDELLM_TARGET
+          value: "http://vllm-cal:8000"
+        - name: GUIDELLM_PROFILE
+          value: "sweep"
+        - name: GUIDELLM_MAX_SECONDS
+          value: "180"
+        # placeholders substituted per archetype by calibration/modeb/run_sweep.sh
+        - name: GUIDELLM_DATA
+          value: "__GUIDELLM_DATA__"
+        - name: GUIDELLM_OUTPUT_DIR
+          value: "__GUIDELLM_OUTPUT_DIR__"
+        - name: GUIDELLM_OUTPUTS
+          value: "csv,json"
+        volumeMounts:
+        - name: results
+          mountPath: "/results"
+      # standard GPU-node toleration only (client requests no GPU); NOT the
+      # llm-d-benchmark-harness taint.
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      restartPolicy: Never
+      volumes:
+      - name: results
+        persistentVolumeClaim:
+          claimName: cal-results-pvc
+  backoffLimit: 2

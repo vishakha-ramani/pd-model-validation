@@ -1,0 +1,77 @@
+# calibration/deploy/guidellm-sweep-job.yaml
+# End-to-end validation: guidellm open-loop rate sweep against the calibrated 70B.
+# Token lengths are PINNED (min=max) so the workload is deterministic and can be
+# replayed into the EDPP rollforward for a clean predicted-vs-measured comparison.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: guidellm-sweep-70b
+  namespace: vramani-perfcal
+  labels:
+    experiment: cal-validate-70b
+spec:
+  template:
+    metadata:
+      labels:
+        experiment: cal-validate-70b
+    spec:
+      # co-locate the client on the vLLM node (RTT ~= 0), same as the calibrate Job
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: vllm-cal
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - name: guidellm-sweep-70b
+        image: ghcr.io/vllm-project/guidellm:v0.5.4
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            mkdir -p "$GUIDELLM_OUTPUT_DIR"
+            guidellm benchmark run \
+              --target "$GUIDELLM_TARGET" \
+              --profile "$GUIDELLM_PROFILE" \
+              --max-seconds "$GUIDELLM_MAX_SECONDS" \
+              --data "$GUIDELLM_DATA" \
+              --request-type text_completions \
+              --output-dir "$GUIDELLM_OUTPUT_DIR" \
+              --outputs "$GUIDELLM_OUTPUTS"
+        env:
+        - name: HF_HOME
+          value: "/tmp"
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token-secret
+              key: token
+        - name: GUIDELLM_TARGET
+          value: "http://vllm-cal:8000"
+        - name: GUIDELLM_PROFILE
+          value: "sweep"
+        - name: GUIDELLM_MAX_SECONDS
+          value: "120"
+        # pinned deterministic workload: 1024-token prompt, 256-token output
+        - name: GUIDELLM_DATA
+          value: "prompt_tokens=1024,prompt_tokens_min=1024,prompt_tokens_max=1024,output_tokens=256,output_tokens_min=256,output_tokens_max=256,random_seed=0"
+        - name: GUIDELLM_OUTPUT_DIR
+          value: "/results/guidellm/sweep-70b-i1024-o256"
+        - name: GUIDELLM_OUTPUTS
+          value: "csv,json"
+        volumeMounts:
+        - name: results
+          mountPath: "/results"
+      # standard GPU-node toleration only (client requests no GPU); NOT the
+      # llm-d-benchmark-harness taint.
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      restartPolicy: Never
+      volumes:
+      - name: results
+        persistentVolumeClaim:
+          claimName: cal-results-pvc
+  backoffLimit: 2

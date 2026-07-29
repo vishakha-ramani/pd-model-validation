@@ -1,0 +1,22 @@
+# calibration/deploy/ttft-analysis-pod.yaml
+# Plain CPU pod (no GPU) mounting the results PVC, for offline TTFT
+# reconstruction from the admission capture. Python image so the analysis
+# package runs in-pod (data-local, no large transfer).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ttft-analysis
+  namespace: vramani-perfcal
+spec:
+  restartPolicy: Never
+  containers:
+  - name: py
+    image: python:3.11-slim
+    command: ["sleep", "7200"]
+    volumeMounts:
+    - name: results
+      mountPath: /mnt/pvc
+  volumes:
+  - name: results
+    persistentVolumeClaim:
+      claimName: cal-results-pvc

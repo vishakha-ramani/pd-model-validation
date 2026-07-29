@@ -1,0 +1,41 @@
+# calibration/deploy/calibrate-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: calibrate
+  namespace: vramani-perfcal
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: vllm-cal
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - name: client
+        image: python:3.11-slim
+        command: ["/bin/sh", "-c"]
+        args:
+          - "pip install --no-cache-dir httpx numpy && python /code/client.py"
+        env:
+        - name: VLLM_BASE
+          value: "http://vllm-cal:8000"
+        - name: HOME
+          value: "/tmp"
+        volumeMounts:
+        - name: code
+          mountPath: /code
+        - name: results
+          mountPath: /results
+      volumes:
+      - name: code
+        configMap:
+          name: calibrate-code
+      - name: results
+        persistentVolumeClaim:
+          claimName: cal-results-pvc

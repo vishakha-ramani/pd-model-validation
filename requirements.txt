@@ -1,0 +1,11 @@
+numpy>=1.26
+httpx>=0.27
+pytest>=8.0
+
+# matplotlib is pinned because the committed reference PNGs get compared
+# byte-for-byte. Rasterized glyph bytes depend on the freetype version bundled
+# with the wheel, and matplotlib changed it. 3.10.8 ships freetype 2.6.1 and
+# 3.11.1 ships 2.14.3, which shifts every text pixel. Any recent version
+# reproduces every number identically. Only the pixels move.
+# See README section 4b.
+matplotlib==3.10.8
