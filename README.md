@@ -217,28 +217,42 @@ figures/
 Run these from the repository root. Total runtime is about a minute.
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python -m pytest calibration -q
 ```
 
 Expect 105 tests to pass.
 
+The first line says `python3` because many systems ship no bare `python`. Every
+later command says `python`, which the activated virtualenv always provides. If
+you skip the virtualenv, substitute `python3` throughout.
+
 ### 4a. Refit the coefficients
 
-```bash
+```sh
 python -m calibration.report \
   --decode calibration/decode.csv \
   --prefill calibration/prefill.csv \
   --mixed calibration/mixed.csv \
   --chunk-bud 8192 --out-dir /tmp/stage0
-diff <(python -c "import json;print(json.dumps(json.load(open('/tmp/stage0/coeffs.json')),sort_keys=True))") \
-     <(python -c "import json;print(json.dumps(json.load(open('coeffs.json')),sort_keys=True))") \
-  && echo "coefficients reproduce bit-exactly"
+
+python -c "import json,sys
+a=json.load(open('/tmp/stage0/coeffs.json')); b=json.load(open('coeffs.json'))
+print('coefficients reproduce bit-exactly' if a==b else 'MISMATCH')
+sys.exit(0 if a==b else 1)"
 ```
 
 Expect `decode_r2` 0.9908, `decode_mape` 0.8647, `prefill_r2` 0.9998, and all
 five coefficients identical to `coeffs.json`.
+
+The same output also prints `prefill_mape` 13.997, which looks alarming beside an
+R² of 0.9998 and is not. `fit_prefill` regresses on the residual
+`ttft - n_c * c_base` rather than on first-token time itself, so its error is
+relative to a residualized target. The nine prompt lengths span two orders of
+magnitude, and the smallest residuals sit near zero, where any absolute error
+becomes a large percentage. R² measures the same fit against the spread of the
+data and is the number to read here.
 
 Expect `mixed_mape` to print **606.8**, and read section 9a before drawing any
 conclusion from it. The honest mixed-regime number is 17.6%, and the difference
@@ -290,11 +304,11 @@ error to a term. Section 8 discusses what it shows.
 python figures/check_reconciliation.py
 ```
 
-This re-derives all 37 headline figures from the raw vendored data, using its own
+This re-derives all 41 headline figures from the raw vendored data, using its own
 implementation of (E1) and of the documented filters rather than importing the
 plotting scripts, so it cross-checks them instead of trusting them. It compares
 against the values written in this README and exits non-zero on any mismatch.
-Expect `37/37 checks passed`. Nothing in it renders pixels, so it holds across
+Expect `41/41 checks passed`. Nothing in it renders pixels, so it holds across
 matplotlib versions.
 
 ---
@@ -698,9 +712,20 @@ and reproduces a prior independent computation of the same quantity:
 | quantity | prior computation | this reconstruction |
 |---|---|---|
 | requests | ~18,278 | 18,277 |
-| overall MAPE | ~9.7% | 9.7% |
-| single-chunk | +8% bias, ~10% MAPE | +8.4%, 10.0% |
-| two-chunk | −1% bias, ~1% MAPE | −1.0%, 1.1% |
+| overall MAPE | ~9.7% | 9.70% |
+| single-chunk MAPE | ~10% | 10.0% |
+| two-chunk MAPE | ~1% | 1.1% |
+| single-chunk median | predictions ~8% high | 8.4% high |
+| two-chunk median | predictions ~1% low | 1.0% low |
+
+Mind the sign convention on those last two rows, because two are in use across
+this repository. `verify_compute_term.py` reports `median_ratio` as realized over
+predicted and `bias` as that ratio minus one, which matches the committed
+`ttft_seg*.json` reports. Under that convention a prediction running high shows a
+negative bias, so the script prints `bias=-7.8%` for single-chunk requests, which
+is the same fact as predictions running 8.4% high. `plot_ttft_full.py` inherits
+the opposite convention from the figure it builds and reports predicted over
+realized. `check_reconciliation.py` asserts both forms so neither can drift.
 
 What remains unverified offline is the driver's segmentation and admission replay
 on the original raw files. The committed `ttft_seg1.json` and `ttft_seg2.json` are
@@ -715,6 +740,31 @@ untested. Every number here is one model on one hardware configuration, vLLM
 0.11.0 with Llama-3.3-70B-Instruct on four H100s. The coefficients are specific
 to that pairing. The functional form of (E1) is the portable claim, and
 re-running stage 0 is what ports it.
+
+### 9f. Two preconditions the driver now checks rather than assumes
+
+An independent audit of `ttft_driver.py` found two unchecked assumptions. Neither
+changes any number reported here, and both are now enforced, because someone
+running this on a fresh capture would have no warning if either broke.
+
+The first is ordering. `bisect_enqueue_bucket` binary-searches the step list by
+`t_start`, while `add_step_deltas` sorts by step number to match the frozen
+parser. Those agree only because `perf_counter` is monotonic within one process
+and steps run sequentially, which holds across all 191,800 steps of the vendored
+capture with zero violations. The frozen linear scan would tolerate an unordered
+list and the binary search cannot, so it now raises instead of returning a
+silently wrong step.
+
+The second is self-inclusion. The arrival bracket is closed at its lower edge, so
+a request whose `t_enq` fell exactly on the `t_start` of the step that admits it
+would appear in its own `B_arrival`, and (E1) would charge its first prefill chunk
+inside `T_iter` while (E3) charged the same chunk again in `W_p`. On the vendored
+capture the smallest realized admission delay is 4.8 microseconds and no delay is
+zero, so `t_enq` always precedes `t_sched` and the bracket always lands on the
+prior in-flight step. The driver now filters the arriving request out of
+`B_arrival` by id, which enforces (E4)'s stated invariant whatever the timestamps
+do, and reports any occurrence as `self_in_arrival_batch`. On a synthetic tie the
+guard prevents a 33% inflation of the compute term.
 
 ---
 
@@ -740,7 +790,7 @@ virtualenv built only from `requirements.txt`, on 2026-07-28.
 | compute term | `verify_compute_term.py` | ~9.7% | 9.70% |
 | error split | `decompose_ttft_error.py` | lands on oracle on bulk | 8.86% vs 8.88% |
 | segment 1 against pin | section 4d | 8.4% and 60.9% | 8.3896%, 60.8645% |
-| all README numbers | `check_reconciliation.py` | 37/37 | 37/37 passed |
+| all README numbers | `check_reconciliation.py` | 41/41 | 41/41 passed |
 | both PNGs | section 4b | match reference | byte-identical at matplotlib 3.10.8 |
 
 One caveat found while doing this. At matplotlib 3.11.1 both figures reproduce

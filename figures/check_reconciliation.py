@@ -224,6 +224,19 @@ def compute_term():
     check("single-chunk MAPE", rep["summed_law.nc1"]["mape_pct"], 10.0, 0.05, "%")
     check("two-chunk MAPE", rep["summed_law.nc2"]["mape_pct"], 1.1, 0.05, "%")
 
+    # Bias, asserted in BOTH sign conventions, because the repository uses both
+    # and a silent flip between them would otherwise go unnoticed. The script's
+    # own `bias_pct` is median(realized/predicted) - 1, so a high prediction reads
+    # negative. README section 9d quotes the reciprocal, how high the prediction
+    # runs. Check the printed value and the README's restatement of it.
+    for key, script_bias, readme_high in (("summed_law.nc1", -7.8, 8.4),
+                                          ("summed_law.nc2", 1.0, -1.0)):
+        v = rep[key]
+        check(f"{key} bias as the script prints it",
+              v["bias_pct"], script_bias, 0.05, "%")
+        check(f"{key} restated as how high the prediction runs",
+              100.0 * (1.0 / v["median_ratio"] - 1.0), readme_high, 0.05, "%")
+
     # (E2) and (E3) sanity, independent of any capture.
     from calibration.admission.ttft_driver import chunk_tokens, n_chunks
     check_exact("(E2) n_c for a 16000-token prompt at kappa 8192",

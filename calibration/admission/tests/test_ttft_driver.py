@@ -213,6 +213,49 @@ def test_bucket_is_half_open_at_the_upper_edge(fixture_segment):
     assert bucket["x"]["step"] == 1
 
 
+def test_bisect_bucket_rejects_a_non_ascending_segment():
+    """The frozen linear scan tolerates an unordered step list and the binary
+    search cannot, so an unordered segment must fail loudly. add_step_deltas
+    orders by step number, and if a capture ever broke the step-to-time
+    correspondence the bisect would otherwise return a silently wrong step."""
+    steps = [
+        {"step": 0, "t_start": 0.0, "t_end_next": 1.0, "reqs": []},
+        {"step": 1, "t_start": 1.0, "t_end_next": 0.5, "reqs": []},
+        {"step": 2, "t_start": 0.5, "t_end_next": 2.0, "reqs": []},
+    ]
+    with pytest.raises(ValueError, match="not ascending"):
+        D.bisect_enqueue_bucket(steps, {"x": {"t_enq": 0.7, "prompt_len": 10}})
+
+
+def test_arrival_batch_excludes_the_arriving_request(fixture_segment):
+    """A request whose t_enq coincides with the t_start of the step that admits it
+    lands in its own bracket. W_p already charges that request's prefill work, so
+    letting it into T_iter would double-count its first chunk.
+
+    Setting t_enq to 1.0 puts A in step 1, which is also A's own first step. That
+    step holds A mid-prefill plus Z decoding with computed = 6. The resident batch
+    is Z alone:
+        T_iter = c_base + c_dec*1 + c_kv*6 = 1.0 + 0.1 + 0.06 = 1.16
+        compute = 2 * 1.16 + 1.275 = 3.595
+    Had A stayed in the batch it would have added its own chunk-0 prefill term,
+    c_pf*100 + c_attn*100*50 = 0.6, giving T_iter 1.76 and compute 4.795, a 33%
+    inflation of the very term this driver exists to measure.
+    """
+    steps, _ = fixture_segment
+    tied, diag = D.compose_segment(steps, {"A": {"t_enq": 1.0, "prompt_len": 150}},
+                                   META, COEFFS, "rollforward", 1)
+    assert diag["self_in_arrival_batch"] == 1, "the tie should be detected"
+    assert tied[0]["r_tadm"] == pytest.approx(0.0)
+    assert tied[0]["compute"] == pytest.approx(3.595)
+    assert tied[0]["compute"] != pytest.approx(4.795), "A's own chunk leaked in"
+
+
+def test_arrival_batch_untied_case_reports_no_self_inclusion(fixture_segment):
+    steps, events = fixture_segment
+    _, diag = D.compose_segment(steps, events, META, COEFFS, "rollforward", 1)
+    assert diag["self_in_arrival_batch"] == 0
+
+
 def test_bucket_drops_arrivals_outside_the_capture_window(fixture_segment):
     steps, _ = fixture_segment
     steps = D.add_step_deltas(steps)

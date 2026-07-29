@@ -244,9 +244,24 @@ def bisect_enqueue_bucket(steps, enq_events):
     search over the (ascending, non-overlapping) t_start values is O(E log S).
     tests/test_ttft_driver.py asserts the two agree.
 
+    Raises ValueError if t_start is not ascending. The frozen linear scan tolerates
+    an unordered step list and this binary search cannot, so the precondition is
+    checked rather than assumed. add_step_deltas sorts by step number, matching the
+    frozen parser, and within one process lifetime perf_counter is monotonic and
+    steps run sequentially, so ordering by step does order by t_start. A capture
+    that violates that has a problem worth failing on rather than bisecting over.
+
     Returns (dict[req_id -> step], dropped_count).
     """
     starts = [s["t_start"] for s in steps]
+    for i in range(1, len(starts)):
+        if starts[i] < starts[i - 1]:
+            raise ValueError(
+                f"t_start is not ascending at index {i} "
+                f"(step {steps[i]['step']}, t_start {starts[i]!r} follows "
+                f"step {steps[i - 1]['step']}, t_start {starts[i - 1]!r}). "
+                f"Binary-search bucketing needs an ordered segment. Check that "
+                f"split_on_reset separated the process lifetimes correctly.")
     bucket = {}
     dropped = 0
     for req_id, enq in enq_events.items():
@@ -344,6 +359,7 @@ def compose_segment(steps, enq_events, meta, coeffs, estimator_name, seg_index):
 
     rows = []
     missing_first_token = 0
+    self_in_arrival_batch = 0
     for req_id, dep in t_adm_deploy.items():
         t_first = first_token.get(req_id)
         if t_first is None:
@@ -355,7 +371,16 @@ def compose_segment(steps, enq_events, meta, coeffs, estimator_name, seg_index):
         t_sched = traces[req_id]["t_sched"]
 
         n_c = n_chunks(prompt_len, kappa)
-        t_iter = A.predict_step(bucket[req_id]["reqs"], coeffs)
+        # T_iter is evaluated on the batch RESIDENT at arrival, which excludes the
+        # arriving request. W_p already charges that request's own prefill work, so
+        # letting it appear here too would double-count its first chunk. The bracket
+        # is closed at its lower edge, so a request whose t_enq coincides with the
+        # t_start of the very step that admits it would land in its own batch.
+        # Filtering by id enforces the invariant whatever the timestamps do.
+        arrival_batch = [r for r in bucket[req_id]["reqs"] if r["id"] != req_id]
+        if len(arrival_batch) != len(bucket[req_id]["reqs"]):
+            self_in_arrival_batch += 1
+        t_iter = A.predict_step(arrival_batch, coeffs)
         compute = n_c * t_iter + prefill_work(prompt_len, kappa, coeffs)
 
         rows.append({
@@ -395,6 +420,7 @@ def compose_segment(steps, enq_events, meta, coeffs, estimator_name, seg_index):
         "censored_excluded": censored_excluded,
         "skipped_already_decoding": len(skipped_already_decoding),
         "skipped_no_first_token": missing_first_token,
+        "self_in_arrival_batch": self_in_arrival_batch,
     }
     return rows, diag
 
