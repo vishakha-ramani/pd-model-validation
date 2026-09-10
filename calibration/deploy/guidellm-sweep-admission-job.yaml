@@ -8,15 +8,15 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: guidellm-sweep-admission
+  name: guidellm-sweep-admission-v2
   namespace: vramani-perfcal
   labels:
-    experiment: cal-validate-70b
+    experiment: cal-validate-70b-v2
 spec:
   template:
     metadata:
       labels:
-        experiment: cal-validate-70b
+        experiment: cal-validate-70b-v2
     spec:
       # co-locate the client on the vLLM node (RTT ~= 0), same as the calibrate Job
       affinity:

@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: vramani-perfcal
+generatorOptions:
+  disableNameSuffixHash: true
+configMapGenerator:
+  - name: calibrate-llama70b-v026-code
+    files:
+      - client.py

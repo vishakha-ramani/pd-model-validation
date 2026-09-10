@@ -3,7 +3,7 @@
 Admission-validation runbook. Deploy the admission-instrumented vLLM 70B.
 Sweep guidellm archetypes against it. Run one fixed-rate overload job on top
 of the sweep. Pull the trajectory and enqueue-event files. Analyze them
-offline with the Task 4 and Task 5 estimators.
+offline with the legacy estimators and the schema-v2 token rollout.
 
 Run every command below from this repository's root.
 
@@ -57,7 +57,7 @@ The hook must confirm it patched the live scheduler loop.
 oc logs deploy/vllm-cal -n vramani-perfcal | grep ADMISSION
 ```
 
-Expect a line like `hook active in pid ... patched Scheduler.add_request +
+Expect a line like `patched EngineCore input arrival + Scheduler.add_request +
 Scheduler.schedule + EngineCore.step`. If this line is missing, the
 sitecustomize hook did not load in the EngineCore child process. Stop and
 diagnose before running any sweep.
@@ -65,7 +65,7 @@ diagnose before running any sweep.
 The captured scheduler config must match the run this capture assumes.
 
 ```bash
-oc exec deploy/vllm-cal -n vramani-perfcal -- cat /results/admission/meta.json
+oc exec deploy/vllm-cal -n vramani-perfcal -- cat /results/admission-v2/meta.json
 ```
 
 Confirm `async_scheduling` is `false`. The offline replay assumes
@@ -73,7 +73,9 @@ synchronous single-step scheduling, the same discipline Mode B captured.
 Confirm `block_size` is present and a positive integer. The offline
 reconstruction of per-request KV-block counts divides by `block_size`, so a
 missing or zero value makes every downstream estimate wrong. Stop and
-diagnose if either check fails.
+diagnose if either check fails. Also require `admission_capture_schema` to be
+`2` and `arrival_probe` to be `EngineCore.preprocess_add_request`; otherwise
+the capture cannot validate the upstream wait or token-level rollout.
 
 ## 4. Sanity probe
 
@@ -87,14 +89,17 @@ curl -s http://localhost:8000/v1/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"meta-llama/Llama-3.3-70B-Instruct","prompt":"Count to five:","max_tokens":256,"temperature":0}'
 kill $PF_PID
-oc exec deploy/vllm-cal -n vramani-perfcal -- tail -n 5 /results/admission/trajectory.jsonl
-oc exec deploy/vllm-cal -n vramani-perfcal -- tail -n 5 /results/admission/admission_events.jsonl
+oc exec deploy/vllm-cal -n vramani-perfcal -- tail -n 5 /results/admission-v2/trajectory.jsonl
+oc exec deploy/vllm-cal -n vramani-perfcal -- tail -n 5 /results/admission-v2/admission_events.jsonl
 ```
 
-Check the rows by hand. Every `trajectory.jsonl` row must carry a
-`waiting_count` field and a `free_kv_blocks` field, not just the Mode-B
-running-batch fields. Every `admission_events.jsonl` row must carry a
-`t_enq` field alongside `req_id` and `prompt_len`. A missing field here
+Check the rows by hand. Every `trajectory.jsonl` row must carry
+`waiting_count`, `free_kv_blocks`, `running_reqs`, `waiting_reqs`, and
+`waiting_work`. The last object must contain an exact
+`remaining_prefill_tokens` aggregate even if queue detail is capped. Every
+`admission_events.jsonl` row must carry `t_engine_arrive`, `t_enq`, and
+`engine_input_wait` alongside `req_id` and `prompt_len`; require
+`0 <= engine_input_wait == t_enq - t_engine_arrive`. A missing field here
 means the live-path guess in `admission_capture.py` or `sitecustomize.py`
 is wrong for this vLLM build. Stop and diagnose before running the sweep.
 Running the full sweep on a wrong live-path guess wastes GPU time and
@@ -116,7 +121,7 @@ Run only the first five lines now. Wait for all five sweep Jobs to
 complete before moving to the overload job.
 
 ```bash
-oc get jobs -n vramani-perfcal -l experiment=cal-validate-70b -w
+oc get jobs -n vramani-perfcal -l experiment=cal-validate-70b-v2 -w
 ```
 
 ## 6. Run the overload job
@@ -133,7 +138,7 @@ above it.
 
 ```bash
 oc exec deploy/vllm-cal -n vramani-perfcal -- \
-  cat /results/guidellm-admission/decode-corner-i256-o512/benchmarks.csv
+  cat /results/guidellm-admission-v2/decode-corner-i256-o512/benchmarks.csv
 ```
 
 Note the boundary between sweep traffic and overload traffic before you
@@ -142,7 +147,7 @@ submit the overload job. This boundary is what later separates the
 
 ```bash
 oc exec deploy/vllm-cal -n vramani-perfcal -- \
-  wc -l /results/admission/admission_events.jsonl
+  wc -l /results/admission-v2/admission_events.jsonl
 ```
 
 Record this line count as `N_BOUNDARY`. Every enqueue event at or before
@@ -169,10 +174,10 @@ build and sustain past queue saturation.
 ```bash
 oc apply -f calibration/deploy/extractor.yaml
 oc wait --for=condition=ready pod/cal-extractor -n vramani-perfcal --timeout=120s
-oc cp vramani-perfcal/cal-extractor:/mnt/pvc/admission/trajectory.jsonl ./trajectory.jsonl
-oc cp vramani-perfcal/cal-extractor:/mnt/pvc/admission/admission_events.jsonl ./admission_events.jsonl
-oc cp vramani-perfcal/cal-extractor:/mnt/pvc/admission/meta.json ./meta.json
-oc cp vramani-perfcal/cal-extractor:/mnt/pvc/guidellm-admission ./guidellm-admission-results
+oc cp vramani-perfcal/cal-extractor:/mnt/pvc/admission-v2/trajectory.jsonl ./trajectory.jsonl
+oc cp vramani-perfcal/cal-extractor:/mnt/pvc/admission-v2/admission_events.jsonl ./admission_events.jsonl
+oc cp vramani-perfcal/cal-extractor:/mnt/pvc/admission-v2/meta.json ./meta.json
+oc cp vramani-perfcal/cal-extractor:/mnt/pvc/guidellm-admission-v2 ./guidellm-admission-v2-results
 ```
 
 ## 8. Analyze offline
@@ -184,6 +189,7 @@ calibration pipeline (see `calibration/RESULTS.md`). Use the same
 
 ```bash
 python - <<'PY'
+import json
 try:
     from modeb.analysis import load_coeffs
 except ImportError:
@@ -191,6 +197,7 @@ except ImportError:
 from calibration.admission.analysis import (
     load_meta, parse_admission_trajectory, parse_enqueue_events, request_traces,
     replay, admission_report, write_admission_report, block_accounting_diag,
+    admission_censored_rows,
 )
 
 coeffs = load_coeffs("coeffs.json")
@@ -206,18 +213,33 @@ def load_of(req_id):
     return "overload" if enq_order[req_id] >= N_BOUNDARY else "sub_capacity"
 
 rows_by_key = {}
-for estimator_name in ("fluid", "rollforward"):
+censored_predictions = {}
+for estimator_name in ("fluid", "rollforward", "token_rollforward"):
     for use_oracle in (True, False):
         variant = "oracle" if use_oracle else "deployable"
-        rows, never_scheduled = replay(steps, enq_events, traces, meta, coeffs,
-                                        estimator_name, use_oracle, load_of)
+        include_censored = estimator_name == "token_rollforward" and not use_oracle
+        rows, never_scheduled = replay(
+            steps, enq_events, traces, meta, coeffs,
+            estimator_name, use_oracle, load_of,
+            include_censored=include_censored)
+        if include_censored:
+            censored_predictions = {
+                row["req_id"]: row["predicted"]
+                for row in rows if row.get("right_censored")
+            }
+            rows = [row for row in rows if not row.get("right_censored")]
         rows_by_key[(estimator_name, variant)] = rows
         print(estimator_name, variant, "rows:", len(rows),
               "never_scheduled:", never_scheduled)
 
 diag_rows = [block_accounting_diag(s, meta) for s in steps]
-report = admission_report(rows_by_key, diag_rows=diag_rows)
+censored_rows = admission_censored_rows(
+    steps, enq_events, traces, load_of, predictions=censored_predictions)
+report = admission_report(rows_by_key, diag_rows=diag_rows,
+                          censored_rows=censored_rows)
 paths = write_admission_report(report, rows_by_key, out_dir=".")
+with open("admission_censored_rows.json", "w") as f:
+    json.dump(censored_rows, f)
 print(paths)
 PY
 ```
@@ -225,7 +247,8 @@ PY
 This produces `admission_report.json` and, if matplotlib is importable,
 `admission_pred_vs_realized.png` in the current directory. No cluster
 access is needed for this step. The report carries the sub_capacity and
-overload rows for the fluid and rollforward estimators and both variants,
+overload rows for the fluid, rollforward, and token_rollforward estimators,
+and both variants,
 plus a block-accounting diagnostic comparing the captured free-KV-block
 count against the count reconstructed from per-request `computed` tokens.
 
@@ -233,20 +256,44 @@ count against the count reconstructed from per-request `computed` tokens.
 estimator and variant. A nonzero `never_scheduled_count` under the
 overload job is expected and is the defining symptom of a standing
 backlog. It counts requests that sat in the waiting queue for the entire
-capture window and never entered the running batch.
+capture window and never entered the running batch. These are emitted once in
+`admission_censored_rows.json` as right-censored observations: their realized
+admission delay is known only to exceed `capture_end - t_engine_arrive`.
+`admission_report.json` summarizes their lower bounds separately; they are not
+treated as exact values and are never included in MAPE.
 
 The harness intentionally excludes the occupancy-blind `waiting`
 estimator from this report. A faithful offline `waiting` prediction needs
 the trained-physics `muDecode`/`muPrefill` values and a waiting-backlog
 work sum ported from `edpp.go`. This harness does not port either one.
-The report validates only the occupancy-aware `fluid` and `rollforward`
-estimators.
+The legacy report validates the occupancy-aware `fluid` and `rollforward`
+estimators. `token_rollforward` is the schema-v2 estimator: it consumes running
+work first, then FIFO queued prompt work under the live token, sequence-slot,
+and KV budgets, and recomputes the affine iteration time after every simulated
+scheduler step. On schema-v1 input it deliberately falls back to the frozen
+`rollforward` estimator.
 
-A request enqueued between two scheduler snapshots is assigned the
-nearest snapshot's observed `waiting_count` as its queue position. Finer
-position is not observable at snapshot granularity. This is an
-acknowledged fidelity limit. It biases toward slight over-prediction
-rather than under-prediction.
+A request arriving between two scheduler snapshots is assigned the current
+snapshot's full queued work and exact count. Per-request detail is capped, but
+the uncapped prompt/computed/cached/KV aggregates are retained. Queue changes
+within the remainder of the in-flight iteration remain an acknowledged
+snapshot-granularity limit.
+
+To reconstruct composed TTFT from the same capture, run:
+
+```bash
+python -m calibration.admission.ttft_driver \
+  --trajectory trajectory.jsonl --events admission_events.jsonl \
+  --meta meta.json --coeffs coeffs.json \
+  --estimator token_rollforward \
+  --out-rows figures/ttft_rows.json \
+  --out-censored figures/ttft_censored.json \
+  --out-dir calibration/admission
+```
+
+The parity rows contain only requests with realized first-token times. The
+separate censored file preserves every enqueued-but-never-scheduled request as
+a lower bound so the missing overload tail is visible next to the parity plot.
 
 ## 9. Tear down
 

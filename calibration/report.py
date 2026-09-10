@@ -16,10 +16,17 @@ def load_csv(path):
         return [tuple(float(x) for x in row) for row in r]
 
 
+def load_csv_inputs(paths):
+    """Load one CSV path or concatenate several compatible CSV shards."""
+    if isinstance(paths, (str, os.PathLike)):
+        paths = [paths]
+    return [row for path in paths for row in load_csv(path)]
+
+
 def run_report(decode_csv, prefill_csv, mixed_csv, chunk_bud, out_dir):
-    dec = load_csv(decode_csv)
-    pre = load_csv(prefill_csv)
-    mix = load_csv(mixed_csv)
+    dec = load_csv_inputs(decode_csv)
+    pre = load_csv_inputs(prefill_csv)
+    mix = load_csv_inputs(mixed_csv)
 
     d = fit_decode(dec)
     p = fit_prefill(pre, c_base=d["c_base"], chunk_bud=chunk_bud)
@@ -54,9 +61,9 @@ def run_report(decode_csv, prefill_csv, mixed_csv, chunk_bud, out_dir):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--decode", required=True)
-    ap.add_argument("--prefill", required=True)
-    ap.add_argument("--mixed", required=True)
+    ap.add_argument("--decode", action="append", required=True)
+    ap.add_argument("--prefill", action="append", required=True)
+    ap.add_argument("--mixed", action="append", required=True)
     ap.add_argument("--chunk-bud", type=int, default=8192)
     ap.add_argument("--out-dir", default=".")
     a = ap.parse_args()

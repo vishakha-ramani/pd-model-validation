@@ -1,9 +1,10 @@
 import json, math, os, sys, tempfile
+import pytest
 from calibration.admission.analysis import (
     load_meta, parse_admission_trajectory, parse_enqueue_events, request_traces,
     build_context, block_accounting_diag,
     RunningMean, deployable_rem_steps_est, enqueue_bucket, replay, admission_report,
-    write_admission_report,
+    admission_censored_rows, write_admission_report,
 )
 from calibration.admission.estimators import ESTIMATORS
 from calibration.modeb.analysis import predict_step, load_coeffs
@@ -73,6 +74,14 @@ def test_parse_enqueue_events_last_write_wins():
     assert events["B"] == {"t_enq": 1.02, "prompt_len": 4}
 
 
+def test_parse_enqueue_events_preserves_upstream_arrival_fields():
+    rows = [{"req_id": "A", "t_engine_arrive": 0.99, "t_enq": 1.01,
+             "engine_input_wait": 0.02, "prompt_len": 4}]
+    events = parse_enqueue_events(_write_jsonl(rows))
+    assert events["A"]["t_engine_arrive"] == 0.99
+    assert events["A"]["engine_input_wait"] == 0.02
+
+
 def test_request_traces_t_sched_and_censor():
     traces = request_traces(STEPS)
     assert traces["A"]["t_sched"] == 1.00
@@ -111,9 +120,13 @@ def test_build_context_for_waiting_request_B_at_step0():
     assert ctx["queue_depth"] == 0                 # B is at index 0 of waiting_ids=["B"]
     assert "queue_pos_from_count" not in ctx
     assert ctx["remaining_steps_est"] == 5.0
-    assert ctx["running"] == [
-        {"steps_done": 0, "kv_blocks": 0, "true_remaining": 2},  # A: last_step_idx(2)-step_idx(0)
-    ]
+    assert ctx["running"] == [{
+        "id": "A", "prompt_len": 4, "computed": 0, "scheduled_tokens": 4,
+        "steps_done": 0, "kv_blocks": 1, "true_remaining": 3,
+        "remaining_est": 6.0,
+    }]
+    assert ctx["current_iter_elapsed"] == 0.0
+    assert ctx["current_iter_remaining"] == expected_t_iter
 
 
 def test_build_context_use_oracle_false_sets_minus_one():
@@ -121,8 +134,31 @@ def test_build_context_use_oracle_false_sets_minus_one():
     enq_b = {"t_enq": 1.0, "prompt_len": 4}
     ctx = build_context(STEPS[0], 0, "B", enq_b, META, COEFFS, traces,
                          use_oracle=False, nout_est=5.0)
-    assert ctx["running"] == [{"steps_done": 0, "kv_blocks": 0, "true_remaining": -1}]
+    assert ctx["running"] == [{
+        "id": "A", "prompt_len": 4, "computed": 0, "scheduled_tokens": 4,
+        "steps_done": 0, "kv_blocks": 1, "true_remaining": -1,
+        "remaining_est": 6.0,
+    }]
     assert ctx["remaining_steps_est"] == 5.0       # unaffected by use_oracle
+
+
+def test_build_context_does_not_subtract_decode_progress_twice():
+    step = {
+        "step": 0, "t_start": 1.0, "t_end": 1.01,
+        "reqs": [{"id": "A", "kappa": 1, "computed": 404, "prompt_len": 4}],
+        "running_reqs": [{"id": "A", "prompt_len": 4, "computed": 404,
+                          "scheduled_tokens": 1, "kv_blocks_est": 26}],
+        "waiting_count": 0, "waiting_ids": [], "waiting_reqs": [],
+        "waiting_work": {"count": 0, "remaining_prefill_tokens": 0},
+        "free_kv_blocks": 100,
+    }
+    ctx = build_context(
+        step, 0, "target", {"t_enq": 1.0, "prompt_len": 4},
+        META, COEFFS, {}, use_oracle=False, nout_est=112.0,
+        output_len_est=512.0)
+    assert ctx["running"][0]["steps_done"] == 400
+    assert ctx["running"][0]["remaining_est"] == 112.0
+    assert ctx["output_steps_est"] == 512.0
 
 
 def test_build_context_running_has_one_entry_per_total_slot_at_step1():
@@ -133,12 +169,12 @@ def test_build_context_running_has_one_entry_per_total_slot_at_step1():
                          use_oracle=True, nout_est=5.0)
     assert ctx["batch_size"] == 2
     assert ctx["running"] == [
-        # A: steps_done = 1 - first_step_idx(0) = 1; kv_blocks = ceil(4/16) = 1;
-        #    true_remaining = last_step_idx(2) - step_idx(1) = 1
-        {"steps_done": 1, "kv_blocks": 1, "true_remaining": 1},
-        # B: steps_done = 1 - first_step_idx(1) = 0; kv_blocks = ceil(0/16) = 0;
-        #    true_remaining = last_step_idx(2) - step_idx(1) = 1
-        {"steps_done": 0, "kv_blocks": 0, "true_remaining": 1},
+        {"id": "A", "prompt_len": 4, "computed": 4, "scheduled_tokens": 1,
+         "steps_done": 0, "kv_blocks": 1, "true_remaining": 2,
+         "remaining_est": 5.0},
+        {"id": "B", "prompt_len": 4, "computed": 0, "scheduled_tokens": 4,
+         "steps_done": 0, "kv_blocks": 1, "true_remaining": 2,
+         "remaining_est": 6.0},
     ]
     # B is no longer in a waiting_ids list at step 1 (empty) and waiting_truncated is False
     # -> fallback branch -> queue_depth = step 1's waiting_count (0 in this fixture),
@@ -154,8 +190,9 @@ def test_build_context_free_kv_blocks_none_reconstructs_and_flags():
     enq_b = {"t_enq": 1.0, "prompt_len": 4}
     ctx = build_context(step, 1, "B", enq_b, META, COEFFS, traces,
                          use_oracle=True, nout_est=5.0)
-    # reconstructed_free = 1000 - (ceil(4/16) + ceil(0/16)) = 1000 - (1 + 0) = 999
-    assert ctx["free_kv_blocks"] == 999
+    # Free-KV is sampled after scheduling, so include this step's grants:
+    # ceil((4+1)/16) + ceil((0+4)/16) = 2 blocks.
+    assert ctx["free_kv_blocks"] == 998
     assert ctx["free_kv_reconstructed"] is True
 
 
@@ -204,12 +241,62 @@ def test_build_context_not_in_snapshot_regression_uses_waiting_count():
     assert ctx["queue_pos_from_count"] is True
 
 
+def test_build_context_uses_upstream_arrival_phase_and_queue_work():
+    traces = request_traces(STEPS)
+    step = dict(STEPS[0])
+    step["waiting_reqs"] = [{"id": "Q", "prompt_len": 100, "computed": 20,
+                              "scheduled_tokens": 0, "cached_tokens": 16,
+                              "remaining_prefill_tokens": 80, "kv_blocks_est": 2}]
+    step["waiting_work"] = {"count": 1, "remaining_prefill_tokens": 80}
+    enq = {"t_engine_arrive": 1.005, "t_enq": 1.019, "prompt_len": 4}
+    c = build_context(step, 0, "B", enq, {**META, "max_num_batched_tokens": 8192},
+                      COEFFS, traces, use_oracle=False, nout_est=5.0)
+    assert c["current_iter_elapsed"] == pytest.approx(0.005)
+    assert c["current_iter_remaining"] == pytest.approx(max(c["t_iter"] - 0.005, 0))
+    assert c["waiting"][0]["remaining_prefill_tokens"] == 80
+    assert c["waiting_work"]["remaining_prefill_tokens"] == 80
+
+
+def test_build_context_adds_same_iteration_input_arrivals_ahead_of_target():
+    traces = request_traces(STEPS)
+    step = dict(STEPS[0])
+    step["running_reqs"] = [{
+        "id": "A", "prompt_len": 4, "computed": 0,
+        "scheduled_tokens": 4, "kv_blocks_est": 1,
+    }]
+    step["waiting_reqs"] = [{
+        "id": "B", "prompt_len": 4, "computed": 0,
+        "scheduled_tokens": 0, "cached_tokens": 0,
+        "remaining_prefill_tokens": 4, "kv_blocks_est": 0,
+    }]
+    step["waiting_work"] = {"count": 1, "prompt_tokens": 4,
+                             "computed_tokens": 0,
+                             "cached_tokens_observed": 0,
+                             "cached_tokens_missing": 0,
+                             "remaining_prefill_tokens": 4,
+                             "full_prompt_kv_blocks": 1}
+    events = {
+        "B": {"t_engine_arrive": 0.99, "t_enq": 1.0, "prompt_len": 4},
+        "X": {"t_engine_arrive": 1.006, "t_enq": 1.02, "prompt_len": 10},
+        "C": {"t_engine_arrive": 1.010, "t_enq": 1.02, "prompt_len": 6},
+    }
+    c = build_context(
+        step, 0, "C", events["C"],
+        {**META, "max_num_batched_tokens": 8}, COEFFS, traces,
+        use_oracle=False, nout_est=5.0, enq_events=events)
+    assert c["queue_depth"] == 2  # captured B plus pending-input X
+    assert c["pending_input_count"] == 1
+    assert [r["id"] for r in c["waiting"]] == ["B", "X"]
+    assert c["waiting_work"]["count"] == 2
+    assert c["waiting_work"]["remaining_prefill_tokens"] == 14
+
+
 def test_block_accounting_diag_exact():
     diag = block_accounting_diag(STEPS[1], META)
-    # reconstructed_free = 1000 - (ceil(4/16) + ceil(0/16)) = 1000 - (1 + 0) = 999
+    # reconstructed after scheduling = 1000 - 2 allocated blocks.
     assert diag["captured_free"] == 90
-    assert diag["reconstructed_free"] == 999
-    assert diag["delta"] == 90 - 999 == -909
+    assert diag["reconstructed_free"] == 998
+    assert diag["delta"] == 90 - 998 == -908
 
 
 def test_block_accounting_diag_none_safe_when_captured_missing():
@@ -217,7 +304,7 @@ def test_block_accounting_diag_none_safe_when_captured_missing():
     step["free_kv_blocks"] = None
     diag = block_accounting_diag(step, META)
     assert diag["captured_free"] is None
-    assert diag["reconstructed_free"] == 999
+    assert diag["reconstructed_free"] == 998
     assert diag["delta"] is None
 
 
@@ -249,6 +336,13 @@ def test_enqueue_bucket_drops_at_or_after_last_edge():
     bucket, dropped = enqueue_bucket(STEPS_PARSED, enq)
     assert dropped == 1
     assert "P3" not in bucket
+
+
+def test_enqueue_bucket_prefers_engine_arrival_over_late_scheduler_enqueue():
+    enq = {"P": {"t_engine_arrive": 1.005, "t_enq": 1.03, "prompt_len": 4}}
+    bucket, dropped = enqueue_bucket(STEPS_PARSED, enq)
+    assert dropped == 0
+    assert bucket["P"]["step"] == 0
 
 
 def test_running_mean_empty_is_one():
@@ -359,6 +453,37 @@ def test_replay_never_scheduled_request_is_skipped_not_raised():
     assert never_scheduled == 1
     assert {r["req_id"] for r in rows} == {"B"}  # Z excluded, no KeyError raised
 
+    censored = admission_censored_rows(
+        steps_parsed, enq, traces, load_of=lambda rid: "sub_capacity")
+    assert [r["req_id"] for r in censored] == ["Z"]
+    assert censored[0]["lower_bound"] == pytest.approx(1.06 - 1.005)
+
+
+def test_replay_can_predict_never_scheduled_without_treating_bound_as_realized():
+    step0 = dict(STEPS[0]); step0["waiting_ids"] = ["Z"]; step0["waiting_count"] = 1
+    step3 = {"step": 3, "t_start": 1.06, "t_end": 1.07,
+             "total_scheduled": 1, "num_running": 1,
+             "reqs": [{"id": "A", "kappa": 1, "computed": 6, "prompt_len": 4}],
+             "waiting_count": 1, "waiting_ids": ["Z"],
+             "waiting_truncated": False, "free_kv_blocks": 70}
+    steps_raw = [step0, STEPS[1], STEPS[2], step3]
+    steps_parsed = parse_admission_trajectory(_write_jsonl(steps_raw))
+    traces = request_traces(steps_raw)
+    enq = {
+        "B": {"t_enq": 1.01, "prompt_len": 4},
+        "Z": {"t_engine_arrive": 1.005, "t_enq": 1.02, "prompt_len": 4},
+    }
+    rows, never_scheduled = replay(
+        steps_parsed, enq, traces, META, COEFFS, "rollforward", False,
+        load_of=lambda rid: "sub_capacity", include_censored=True)
+    assert never_scheduled == 1
+    z = next(r for r in rows if r["req_id"] == "Z")
+    assert z["right_censored"] is True
+    assert z["realized"] is None
+    assert z["ratio"] is None
+    assert z["lower_bound"] == pytest.approx(1.06 - 1.005)
+    assert z["known_underprediction_lower_bound"] >= 0
+
 
 def test_admission_report_buckets_into_sub_capacity_and_overload():
     row_sub = {"req_id": "r1", "predicted": 2.0, "realized": 4.0, "ratio": 2.0,
@@ -384,16 +509,38 @@ def test_admission_report_buckets_into_sub_capacity_and_overload():
 def test_admission_report_includes_block_accounting_default():
     report = admission_report({})
     assert report["block_accounting"] == {"n": 0, "mean_abs_delta": None, "max_abs_delta": None}
+    assert report["right_censored"]["n"] == 0
+
+
+def test_admission_report_keeps_censored_bounds_out_of_mape():
+    row = {"req_id": "r1", "predicted": 2.0, "realized": 4.0, "ratio": 2.0,
+           "load_bin": "sub_capacity", "regime_at_enq": "pure_decode"}
+    censored = [
+        {"req_id": "z1", "lower_bound": 5.0, "load_bin": "overload",
+         "predicted": 4.0, "prediction_below_lower_bound": True,
+         "known_underprediction_lower_bound": 1.0},
+        {"req_id": "z2", "lower_bound": 9.0, "load_bin": "overload",
+         "predicted": 10.0, "prediction_below_lower_bound": False,
+         "known_underprediction_lower_bound": 0.0},
+    ]
+    report = admission_report(
+        {("token_rollforward", "deployable"): [row]}, censored_rows=censored)
+    stats = report["sub_capacity"]["token_rollforward"]["deployable"]["sub_capacity"]
+    assert stats["mape"] == pytest.approx(50.0)
+    assert report["right_censored"]["n"] == 2
+    assert report["right_censored"]["lower_bound_s_p50"] == pytest.approx(7.0)
+    assert report["right_censored"]["by_load_bin"] == {"overload": 2}
+    assert report["right_censored"]["prediction_below_lower_bound_frac"] == 0.5
 
 
 def test_admission_report_block_accounting_from_diag_rows():
-    diag_rows = [{"captured_free": 90, "reconstructed_free": 999, "delta": -909},
+    diag_rows = [{"captured_free": 90, "reconstructed_free": 998, "delta": -908},
                  {"captured_free": None, "reconstructed_free": 5, "delta": None},
                  {"captured_free": 10, "reconstructed_free": 8, "delta": 2}]
     report = admission_report({}, diag_rows=diag_rows)
     assert report["block_accounting"]["n"] == 2
-    assert abs(report["block_accounting"]["mean_abs_delta"] - (909 + 2) / 2) < 1e-9
-    assert report["block_accounting"]["max_abs_delta"] == 909
+    assert abs(report["block_accounting"]["mean_abs_delta"] - (908 + 2) / 2) < 1e-9
+    assert report["block_accounting"]["max_abs_delta"] == 908
 
 
 def test_write_admission_report_writes_json_and_png(tmp_path=None):

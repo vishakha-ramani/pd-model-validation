@@ -10,10 +10,10 @@ data:
     Sibling of the frozen calibration/modeb/sitecustomize.py hook. Reuses that
     module's JsonlWriter/_log/_PATCHED structure and its extract_reqs() call on
     the scheduler output, and additionally captures:
-      - per-request enqueue events (admission_events.jsonl), via a
-        Scheduler.add_request patch stamped with time.perf_counter();
-      - the waiting-queue snapshot and free-KV-block count at schedule time, via
-        a Scheduler.schedule patch;
+      - EngineCore input arrival and Scheduler.add_request timestamps, measuring
+        the wait for an in-flight iteration rather than starting after it;
+      - full queued-work aggregates, capped per-request queue detail, the complete
+        running set, and free-KV state at schedule time;
       - an extended per-step trajectory record (trajectory.jsonl) that adds the
         waiting-queue/free-KV fields to the Mode-B running-batch fields.
 
@@ -31,11 +31,15 @@ data:
         # In the container both this file and its sibling capture module sit at
         # PYTHONPATH=/opt/admission as top-level modules, alongside the frozen
         # Mode-B capture module at /opt/modeb.
-        from admission_capture import build_enqueue_record, cap_waiting, build_admission_step_record
+        from admission_capture import (
+            build_enqueue_record, build_request_work_record,
+            cap_waiting, summarize_waiting, build_admission_step_record,
+        )
     except ImportError:
         # In the offline test env this file is imported as calibration.admission.sitecustomize.
         from calibration.admission.admission_capture import (
-            build_enqueue_record, cap_waiting, build_admission_step_record,
+            build_enqueue_record, build_request_work_record,
+            cap_waiting, summarize_waiting, build_admission_step_record,
         )
 
     try:
@@ -54,7 +58,7 @@ data:
 
 
     MAX_WAITING_IDS = _int_env("ADMISSION_MAX_WAITING_IDS", 512)
-    OUT_DIR = os.environ.get("ADMISSION_OUT_DIR", "/results/admission")
+    OUT_DIR = os.environ.get("ADMISSION_OUT_DIR", "/results/admission-v2")
 
 
     def _log(msg):
@@ -97,6 +101,9 @@ data:
             "block_size": vllm_config.cache_config.block_size,
             "max_num_seqs": sc.max_num_seqs,
             "waiting_ids_cap": MAX_WAITING_IDS,
+            "admission_capture_schema": 2,
+            "arrival_clock": "perf_counter",
+            "arrival_probe": "EngineCore.preprocess_add_request",
             "enq_clock": "perf_counter",
         }
 
@@ -113,12 +120,28 @@ data:
             return False  # vllm not present (e.g. offline test env) -> no-op
 
         state = {"writer": None, "enq_writer": None, "prompt_len_cache": {}, "step": 0,
-                 "last_output": None, "last_waiting": [], "last_free_kv": None,
-                 "meta_written": False}
+                 "last_output": None, "last_waiting": [], "last_waiting_reqs": [],
+                 "last_waiting_work": None, "last_running_reqs": [],
+                 "last_free_kv": None, "arrivals": {}, "meta_written": False}
 
+        _orig_preprocess_add_request = EngineCore.preprocess_add_request
         _orig_add_request = Scheduler.add_request
         _orig_schedule = Scheduler.schedule
         _orig_step = EngineCore.step
+
+        def preprocess_add_request(self, request, *a, **kw):
+            # Runs in the input-socket thread before the converted request is
+            # placed on EngineCoreProc.input_queue.
+            t_engine_arrive = time.perf_counter()
+            result = _orig_preprocess_add_request(self, request, *a, **kw)
+            try:
+                converted = result[0] if isinstance(result, tuple) else result
+                rid = getattr(converted, "request_id", None) or getattr(converted, "req_id", None)
+                if rid is not None:
+                    state["arrivals"][rid] = t_engine_arrive
+            except Exception:
+                pass
+            return result
 
         def add_request(self, request, *a, **kw):
             # Call the original first so a raising original is never masked by
@@ -135,24 +158,41 @@ data:
                     plen = 0
                 if state["enq_writer"] is None:
                     os.makedirs(OUT_DIR, exist_ok=True)
-                    state["enq_writer"] = JsonlWriter(os.path.join(OUT_DIR, "admission_events.jsonl"))
-                state["enq_writer"].write(build_enqueue_record(rid, t_enq, plen))
+                    # Enqueue events are sparse relative to scheduler steps. Persist
+                    # each one immediately so a one-request schema gate is observable
+                    # and process shutdown cannot discard the last 49 arrivals.
+                    state["enq_writer"] = JsonlWriter(
+                        os.path.join(OUT_DIR, "admission_events.jsonl"), flush_every=1)
+                t_engine_arrive = state["arrivals"].pop(rid, None)
+                state["enq_writer"].write(
+                    build_enqueue_record(rid, t_enq, plen, t_engine_arrive))
             except Exception:
                 pass
             return result
 
         def schedule(self):
             out = _orig_schedule(self)
+            scheduled = getattr(out, "num_scheduled_tokens", {}) or {}
+            block_size = getattr(self, "block_size", 1)
             try:
-                waiting_ids = [getattr(r, "request_id", getattr(r, "req_id", None)) for r in self.waiting]
+                waiting_all = [build_request_work_record(r, 0, block_size) for r in self.waiting]
             except Exception:
-                waiting_ids = []
+                waiting_all = []
+            try:
+                running_all = [build_request_work_record(
+                    r, scheduled.get(getattr(r, "request_id", None), 0), block_size)
+                    for r in self.running]
+            except Exception:
+                running_all = []
             try:
                 free_kv = self.kv_cache_manager.block_pool.get_num_free_blocks()
             except Exception:
                 free_kv = None
             state["last_output"] = out
-            state["last_waiting"] = waiting_ids
+            state["last_waiting"] = [r["id"] for r in waiting_all]
+            state["last_waiting_reqs"] = waiting_all[:MAX_WAITING_IDS]
+            state["last_waiting_work"] = summarize_waiting(waiting_all, block_size)
+            state["last_running_reqs"] = running_all
             state["last_free_kv"] = free_kv
             return out
 
@@ -185,16 +225,21 @@ data:
                 rec = build_admission_step_record(
                     state["step"], t_start, t_end, out.total_num_scheduled_tokens,
                     sum(1 for r in reqs if r["computed"] >= r["prompt_len"]),
-                    reqs, count, ids, trunc, state["last_free_kv"])
+                    reqs, count, ids, trunc, state["last_free_kv"],
+                    running_reqs=state["last_running_reqs"],
+                    waiting_reqs=state["last_waiting_reqs"],
+                    waiting_work=state["last_waiting_work"])
                 state["writer"].write(rec)
                 state["step"] += 1
             return result
 
+        EngineCore.preprocess_add_request = preprocess_add_request
         Scheduler.add_request = add_request
         Scheduler.schedule = schedule
         EngineCore.step = step
         _PATCHED = True
-        _log("patched Scheduler.add_request + Scheduler.schedule + EngineCore.step")
+        _log("patched EngineCore input arrival + Scheduler.add_request + "
+             "Scheduler.schedule + EngineCore.step")
         return True
 
 
@@ -204,13 +249,69 @@ data:
 
     Self-contained (stdlib only, no vllm) so it is unit-testable offline and safe
     to ship in a ConfigMap. Reuses the frozen Mode-B extract_reqs for the running
-    batch; adds enqueue-event records and the waiting-queue / free-KV per-step fields.
+    batch; adds enqueue-event records and scheduler-work snapshots.  This module is
+    kept independent of vLLM so every attribute fallback can be tested offline.
     """
 
+    import math
 
-    def build_enqueue_record(req_id, t_enq, prompt_len):
-        """One row per request at its enqueue instant. prompt_len drives ReqKVNeed offline."""
-        return {"req_id": req_id, "t_enq": t_enq, "prompt_len": int(prompt_len)}
+
+    def build_enqueue_record(req_id, t_enq, prompt_len, t_engine_arrive=None):
+        """One row per request, retaining both sides of the EngineCore input wait."""
+        rec = {"req_id": req_id, "t_enq": t_enq, "prompt_len": int(prompt_len)}
+        if t_engine_arrive is not None:
+            rec["t_engine_arrive"] = t_engine_arrive
+            rec["engine_input_wait"] = max(0.0, t_enq - t_engine_arrive)
+        return rec
+
+
+    def _request_id(request):
+        return getattr(request, "request_id", None) or getattr(request, "req_id", None)
+
+
+    def _prompt_len(request):
+        value = getattr(request, "num_prompt_tokens", None)
+        if value is not None:
+            return int(value)
+        tokens = getattr(request, "prompt_token_ids", None)
+        return len(tokens) if tokens is not None else 0
+
+
+    def build_request_work_record(request, scheduled_tokens=0, block_size=1):
+        prompt_len = _prompt_len(request)
+        computed = int(getattr(request, "num_computed_tokens", 0) or 0)
+        scheduled = int(scheduled_tokens or 0)
+        cached = getattr(request, "num_cached_tokens", None)
+        if cached is not None:
+            cached = int(cached)
+            if cached < 0:
+                cached = None
+        block_size = max(int(block_size or 1), 1)
+        allocated_tokens = max(computed + scheduled, 0)
+        return {
+            "id": _request_id(request),
+            "prompt_len": prompt_len,
+            "computed": computed,
+            "scheduled_tokens": scheduled,
+            "cached_tokens": cached,
+            "remaining_prefill_tokens": max(prompt_len - computed, 0),
+            "kv_blocks_est": int(math.ceil(allocated_tokens / block_size)),
+        }
+
+
+    def summarize_waiting(records, block_size=1):
+        """Exact aggregate work for the full queue, even when detail is capped."""
+        block_size = max(int(block_size or 1), 1)
+        return {
+            "count": len(records),
+            "prompt_tokens": sum(r["prompt_len"] for r in records),
+            "computed_tokens": sum(r["computed"] for r in records),
+            "cached_tokens_observed": sum((r["cached_tokens"] or 0) for r in records),
+            "cached_tokens_missing": sum(r["cached_tokens"] is None for r in records),
+            "remaining_prefill_tokens": sum(r["remaining_prefill_tokens"] for r in records),
+            "full_prompt_kv_blocks": sum(
+                int(math.ceil(r["prompt_len"] / block_size)) for r in records),
+        }
 
 
     def cap_waiting(waiting_ids, max_ids):
@@ -225,9 +326,10 @@ data:
 
     def build_admission_step_record(step, t_start, t_end, total_scheduled, num_running,
                                     reqs, waiting_count, waiting_ids, waiting_truncated,
-                                    free_kv_blocks):
+                                    free_kv_blocks, running_reqs=None,
+                                    waiting_reqs=None, waiting_work=None):
         """Assemble one JSONL row: Mode-B running-batch fields plus the queue-and-KV snapshot."""
-        return {
+        rec = {
             "step": step,
             "t_start": t_start,
             "t_end": t_end,
@@ -239,6 +341,13 @@ data:
             "waiting_truncated": waiting_truncated,
             "free_kv_blocks": free_kv_blocks,
         }
+        if running_reqs is not None:
+            rec["running_reqs"] = running_reqs
+        if waiting_reqs is not None:
+            rec["waiting_reqs"] = waiting_reqs
+        if waiting_work is not None:
+            rec["waiting_work"] = waiting_work
+        return rec
   modeb_capture.py: |
     """Pure per-step extraction for Mode-B vLLM instrumentation.
 

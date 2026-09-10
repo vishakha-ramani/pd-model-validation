@@ -14,15 +14,15 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: guidellm-overload-admission
+  name: guidellm-overload-admission-v2
   namespace: vramani-perfcal
   labels:
-    experiment: cal-validate-70b
+    experiment: cal-validate-70b-v2
 spec:
   template:
     metadata:
       labels:
-        experiment: cal-validate-70b
+        experiment: cal-validate-70b-v2
     spec:
       # co-locate the client on the vLLM node (RTT ~= 0), same as the sweep Job
       affinity:
@@ -71,7 +71,7 @@ spec:
         - name: GUIDELLM_DATA
           value: "prompt_tokens=256,prompt_tokens_min=256,prompt_tokens_max=256,output_tokens=512,output_tokens_min=512,output_tokens_max=512,random_seed=0"
         - name: GUIDELLM_OUTPUT_DIR
-          value: "/results/guidellm-admission/overload-decode-corner-i256-o512"
+          value: "/results/guidellm-admission-v2/overload-decode-corner-i256-o512"
         - name: GUIDELLM_OUTPUTS
           value: "csv,json"
         volumeMounts:

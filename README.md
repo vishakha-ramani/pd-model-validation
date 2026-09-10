@@ -1,4 +1,354 @@
-# Real-engine validation of a prefill/decode latency model
+# Real-engine prefill/decode latency-model validation
+
+This repository measures the physical quantities used by the causal SLO
+externality router against live vLLM deployments. The current calibration runs
+Qwen3-14B on one H100 and Llama-3.3-70B-Instruct on four H100s. It separates
+decode-only and prefill-only traffic to identify the latency coefficients, then
+uses mixed prefill-plus-decode traffic only as held-out validation.
+
+The newest completed experiment is the Llama-3.3-70B calibration on vLLM 0.26.0.
+All three replicates, fitted coefficients, residuals, plot, and cross-replicate
+report are committed under
+[`calibration/results/llama3.3-70b-tp4-vllm-0.26.0/replicates-v4`](calibration/results/llama3.3-70b-tp4-vllm-0.26.0/replicates-v4).
+
+## What happens during one iteration
+
+During one GPU iteration, vLLM can simultaneously:
+
+- advance every decoding request by one token;
+- process chunks of one or more prefilling requests;
+- read the KV context required by decode attention; and
+- compute attention between new prefill tokens and their preceding context.
+
+We model the duration of that iteration as
+
+$$
+T =
+\alpha
++c_{\mathrm{dec}}B
++c_{\mathrm{kv}}K
++c_{\mathrm{pf}}S
++c_{\mathrm{attn}}U.
+$$
+
+Here $B$ is the number of requests decoding in the iteration, $K$ is the
+sum of their resident context lengths, $S$ is the number of prefill tokens
+scheduled in the iteration, and $U$ is the prefill attention work. The five
+coefficients have the following physical meanings.
+
+| Coefficient | Physical meaning |
+|---|---|
+| \(\alpha\) | Fixed cost of running an iteration |
+| \(c_{\rm dec}\) | Marginal cost of carrying one decoding request |
+| \(c_{\rm kv}\) | Marginal cost of reading one resident KV token |
+| \(c_{\rm pf}\) | Marginal linear-layer cost of one prefill token |
+| \(c_{\rm attn}\) | Marginal cost of one unit of prefill attention |
+
+For a prefill chunk of \(\kappa\) tokens beginning after a causal prefix of
+\(P\) tokens,
+
+$$
+U=\kappa\left(P+\frac{\kappa}{2}\right).
+$$
+
+This is the intended interpretation of the iteration law: one baseline cost
+plus the marginal contributions of the decode and prefill work that vLLM
+actually schedules.
+
+## Environment calibrated by the newest run
+
+The server is defined in
+[`calibration/deploy/vllm-llama70b-tp4-v026.yaml`](calibration/deploy/vllm-llama70b-tp4-v026.yaml).
+
+| Setting | Value |
+|---|---|
+| Model | `meta-llama/Llama-3.3-70B-Instruct` |
+| Model revision | `6f6073b423013f6a7d4d9f39144961bfbfbc386b` |
+| vLLM | `0.26.0` |
+| Container | `docker.io/vllm/vllm-openai@sha256:770fe65b2c73ee74a5c42165cf3433de4048cc2cd9c57a937ca4e35aba5aa87b` |
+| Hardware | 4 H100 GPUs |
+| Tensor parallelism | 4 |
+| Maximum model length | 32,768 tokens |
+| Maximum sequences | 128 |
+| Iteration token budget | 8,192 tokens |
+| KV block size | 16 tokens |
+| Prefix caching | Disabled |
+| Chunked prefill | Enabled |
+| Measured KV capacity | 506,368 tokens |
+
+These settings are part of the coefficient definition. Changing the model,
+model revision, GPU, tensor parallelism, vLLM version, precision, or scheduler
+settings can change the measured coefficients.
+
+`max_num_seqs` is a scheduler ceiling, not the batch size measured by the
+regression. vLLM uses continuous batching, so the active decode batch $B$
+changes from iteration to iteration. The calibration deliberately measures
+several values of $B$ below that ceiling.
+
+## Isolating the decode terms
+
+To estimate \(\alpha,c_{\rm dec},c_{\rm kv}\), the client creates iterations
+with no prefill work. The law reduces to
+
+$$
+T_{\rm decode}=\alpha+c_{\rm dec}B+c_{\rm kv}K.
+$$
+
+The experiment sweeps:
+
+- decode batch \(B\) over 1, 2, 4, 8, 16, 32, and 64;
+- prompt context over 64, 256, 1,024, 4,096, and 6,144 tokens; and
+- 256 generated tokens per request.
+
+For a synchronized cell whose requests have equal prompt length $n$ and
+generated-token index $k$, the aggregate resident context is
+
+$$
+K=B(n+k).
+$$
+
+The client submits $B$ concurrent streaming requests and timestamps every
+generated token. It waits until every submitted request has emitted four
+warm-up tokens before retaining any gaps. This wall-clock barrier matters:
+without it, a large prompt could still be prefilling while the client labels
+the submitted concurrency as a resident decode batch. That would contaminate
+the decode-only fit with prefill work. The implementation is
+[`steady_decode_steps`](calibration/client.py).
+
+For each aligned iteration, the client takes the median inter-token gap across
+the streams. Each replicate produced 35 decode cells and approximately 8,591
+usable iteration rows.
+
+Before ordinary least squares, the fit median-aggregates every \((B,n)\) cell.
+Within one cell, the change caused by a few additional KV tokens is smaller than
+ordinary step-time jitter. The independent changes across batch size and prompt
+length identify the coefficients much more reliably. The regression uses the
+feature vector
+
+$$
+[1,\ B,\ B(n+k)]
+$$
+
+against the observed iteration duration. The implementation is
+[`fit_decode`](calibration/fit.py).
+
+## Isolating the prefill terms
+
+To estimate \(c_{\rm pf}\) and \(c_{\rm attn}\), the client submits one request
+at a time and asks for one output token. There are no resident decode requests.
+Prompt lengths are 64, 128, 256, 512, 1,024, 2,048, 4,096, 8,192, 12,000,
+16,000, and 24,000 tokens, with ten repetitions per length and seed.
+
+For prompt length $N$, vLLM needs
+
+$$
+n_c=\left\lceil\frac{N}{8192}\right\rceil
+$$
+
+iterations. The first-token model is
+
+$$
+T_{\rm prefill}
+=n_c\alpha+c_{\rm pf}N+c_{\rm attn}\frac{N^2}{2}.
+$$
+
+The attention term follows from the chunk identity
+
+$$
+\sum_j \kappa_j\left(P_j+\frac{\kappa_j}{2}\right)=\frac{N^2}{2}.
+$$
+
+We subtract the already fitted baseline,
+
+$$
+y=T_{\rm prefill}-n_c\alpha,
+$$
+
+then regress $y$ on $N$ and $N^2/2$. The prefill fit therefore does not
+introduce a second free intercept that could hide an error in the baseline.
+The three replicates contain 330 prefill observations in total.
+
+## Testing, rather than fitting, mixed iterations
+
+Mixed data is not used to estimate any coefficient. The client first creates a
+resident decode batch with 4, 8, 16, or 32 requests, each with a 4,096-token
+context. It then injects a 24,000-token prompt. With the configured token budget,
+that prompt nominally occupies three prefill iterations: 8,192, 8,192, and
+7,616 tokens.
+
+Client-side HTTP admission and first-token delivery add ordinary decode gaps at
+the edges of the observed window. For each decode stream, the client therefore
+selects the three longest overlapping gaps and restores them to chronological
+order before labeling the corresponding prefill positions. The resulting
+measurement is compared with
+
+$$
+\widehat T_{\rm mixed}
+=\alpha+c_{\rm dec}B+c_{\rm kv}K
++c_{\rm pf}\kappa
++c_{\rm attn}\kappa(P+\kappa/2).
+$$
+
+Because mixed observations do not participate in fitting, their error tests the
+central additive assumption: coefficients learned from isolated decode and
+prefill must predict an iteration in which both phases share the accelerator.
+
+## Repeating the experiment and holding out each seed
+
+The Kubernetes job is defined in
+[`calibration/deploy/calibrate-llama70b-v026-replicates-job.yaml`](calibration/deploy/calibrate-llama70b-v026-replicates-job.yaml).
+It ran seeds 0, 1, and 2 sequentially against the same engine. Each seed issued
+635 decode requests, 110 prefill requests, and 640 mixed-regime requests: 1,385
+requests per seed and 4,155 requests overall.
+
+[`calibration.replicate_report`](calibration/replicate_report.py) performs three
+leave-one-replicate-out folds. Each fold fits two seeds and predicts the unseen
+third seed. This reveals whether a coefficient is tied to one random-token
+sample or one moment in the run rather than to the serving configuration.
+
+The automated coverage gate passed for all three replicates:
+
+- all 35 decode cells are present;
+- every decode cell has at least 202 retained rows, versus 32 required;
+- every prefill length has ten observations;
+- every mixed batch has 30 observations; and
+- every decode replicate records that the steady-state barrier was active.
+
+The complete report is
+[`replicate-validation.json`](calibration/results/llama3.3-70b-tp4-vllm-0.26.0/replicates-v4/replicate-validation.json).
+
+## Final vLLM 0.26.0 Llama coefficients
+
+The fit over all three replicates produced:
+
+| Coefficient | Seconds | EPP microseconds |
+|---|---:|---:|
+| \(\alpha\) | 0.0149963823 | 14,996.382 |
+| \(c_{\rm dec}\) | \(2.57620\times10^{-5}\) | 25.762/request |
+| \(c_{\rm kv}\) | \(2.69182\times10^{-8}\) | 0.026918/KV token |
+| \(c_{\rm pf}\) | \(6.55559\times10^{-5}\) | 65.556/prefill token |
+| \(c_{\rm attn}\) | \(1.13626\times10^{-9}\) | 0.001136/attention unit |
+
+Machine-readable values are in
+[`combined-fit/coeffs.json`](calibration/results/llama3.3-70b-tp4-vllm-0.26.0/replicates-v4/combined-fit/coeffs.json).
+
+The leave-one-replicate-out coefficient variation is small:
+
+| Coefficient | Coefficient of variation |
+|---|---:|
+| \(\alpha\) | 0.78% |
+| \(c_{\rm dec}\) | 1.09% |
+| \(c_{\rm kv}\) | 0.36% |
+| \(c_{\rm pf}\) | 0.04% |
+| \(c_{\rm attn}\) | 0.18% |
+
+Held-out prediction errors are:
+
+| Regime | Median absolute percentage error | 95th percentile |
+|---|---:|---:|
+| Decode-only | 1.0--2.4% | 3.1--4.6% |
+| Prefill-only TTFT | 2.5--2.9% | 11.9--12.8% |
+| Mixed | 3.1--3.9% | 9.2--10.2% |
+
+The final combined fit reports decode MAPE 0.94%, decode \(R^2=0.995\),
+prefill \(R^2=0.99988\), and held-out mixed MAPE 3.68%. Its reported raw
+`prefill_mape` is 9.0% because that diagnostic first subtracts the iteration
+baseline and divides by the remaining marginal work, which is very small for
+short prompts. The held-out full-TTFT error in the table is the more
+interpretable user-visible quantity.
+
+## One iteration worked by hand
+
+Consider 32 decoding requests with aggregate decode context
+\(K=135{,}168\), sharing an iteration with the first 8,192-token chunk of a
+long prompt. The fitted model predicts
+
+$$
+T_{\rm decode}=19.46\ \mathrm{ms},
+\qquad
+T_{\rm prefill}=590.16\ \mathrm{ms},
+$$
+
+and
+
+$$
+T_{\rm mixed}=594.62\ \mathrm{ms}.
+$$
+
+The prefill work dominates this iteration. Adding that work to a decoder delays
+every resident request, which is exactly the interference that the causal SLO
+externality term is intended to value.
+
+## Reproducing the v0.26 analysis locally
+
+After copying `replicates-v4` from the results PVC, run:
+
+```bash
+python3 -m pytest \
+  calibration/tests/test_client_logic.py \
+  calibration/tests/test_fit.py \
+  calibration/tests/test_report.py \
+  calibration/tests/test_replicate_report.py -q
+
+R=calibration/results/llama3.3-70b-tp4-vllm-0.26.0/replicates-v4
+
+python3 -m calibration.replicate_report \
+  --replicate-dir "$R/replicate-0" \
+  --replicate-dir "$R/replicate-1" \
+  --replicate-dir "$R/replicate-2" \
+  --chunk-bud 8192 \
+  --out "$R/replicate-validation.json"
+
+python3 -m calibration.report \
+  --decode "$R/replicate-0/decode.csv" \
+  --decode "$R/replicate-1/decode.csv" \
+  --decode "$R/replicate-2/decode.csv" \
+  --prefill "$R/replicate-0/prefill.csv" \
+  --prefill "$R/replicate-1/prefill.csv" \
+  --prefill "$R/replicate-2/prefill.csv" \
+  --mixed "$R/replicate-0/mixed.csv" \
+  --mixed "$R/replicate-1/mixed.csv" \
+  --mixed "$R/replicate-2/mixed.csv" \
+  --chunk-bud 8192 \
+  --out-dir "$R/combined-fit"
+```
+
+The first command tests the timestamp alignment, fitting, reporting, and
+cross-replicate logic. The second checks sample coverage, coefficient stability,
+and held-out prediction. The third fits the final coefficients using all three
+replicates and regenerates the mixed prediction plot.
+
+## What this result does and does not establish
+
+The experiment supports the iteration law inside its measured region:
+
+- decode batch at most 64;
+- prompt length at most 24,000 tokens;
+- Llama-3.3-70B on four H100s with tensor parallelism four; and
+- the exact vLLM and scheduler configuration listed above.
+
+It does not yet establish complete router correctness or a goodput improvement.
+Four limitations remain important.
+
+1. These measurements use token timestamps at a colocated streaming client,
+   not an internal vLLM scheduler timestamp.
+2. The mixed client infers which gaps carried prefill. It does not directly
+   record the scheduler's actual \(B,K,S,U\) for every iteration.
+3. Decode tokens consume part of `max_num_batched_tokens`, so the actual
+   prefill grant can be slightly smaller than the nominal chunk label.
+4. The three seeds vary requests and time, but use the same engine and node;
+   they do not measure node-to-node hardware variation.
+
+The next validation step is therefore teacher-forced instrumentation. vLLM
+must record the actual scheduled \(B,K,S,U\) and iteration duration. Feeding
+that exact batch composition into the law separates formula error from errors
+in EPP's view of server state. After that, a controlled Qwen 1P2D workload can
+trace every request from arrival, through candidate scores and placement, to
+measured TTFT, ITL, end-to-end latency, and SLO goodput.
+
+---
+
+## Legacy vLLM 0.11.0 Mode-B and admission-validation study
 
 This repository reproduces the measurements behind two figures, `titer_modeb.png`
 and `ttft_parity.png`. Both test a closed-form model of vLLM iteration timing
@@ -116,26 +466,30 @@ Two variants share that compute term and differ only in `T_adm`.
 
 - **oracle** substitutes each request's realized admission delay from (E5). Any
   error left is then attributable to the closed-form terms.
-- **deployable** uses the roll-forward estimator a router actually runs online,
-  which sees a queue snapshot and a censored mean output length. It is
-  implemented in `calibration/admission/estimators.py` and replayed by
-  `calibration/admission/analysis.py`.
+- **deployable** uses an admission estimator a router can run online. The
+  schema-v2 `token_rollforward` estimator replays the running-first, FIFO-waiting
+  scheduler under token, sequence-slot, and KV budgets, recomputing iteration
+  latency after every simulated step. The frozen `rollforward` remains available
+  to reproduce the original results.
 
 ### (E5) Realized quantities
 
-Three timestamps come out of the capture. `t_enq` is when the request was
-enqueued. `t_sched` is the start of the first step in which it appears. `t_first`
-is the start of the first step in which `computed_r >= prompt_len_r`, which is the
-step where its prefill has finished and the first token exists. Then
+Schema-v2 captures retain two arrival-side timestamps. `t_engine_arrive` is
+stamped before the request enters EngineCore's input queue; `t_enq` is stamped
+later in `Scheduler.add_request`. Let `t_arrive = t_engine_arrive` when present,
+falling back to `t_enq` for the legacy capture. `t_sched` is the start of the
+first step in which the request appears. `t_first` is the start of the first step
+in which `computed_r >= prompt_len_r`, where its prefill has completed and the
+first token exists. Then
 
 ```
-T_adm_realized   = t_sched - t_enq
+T_adm_realized   = t_sched - t_arrive
 prefill_realized = t_first - t_sched
-TTFT_realized    = t_first - t_enq
+TTFT_realized    = t_first - t_arrive
 ```
 
-Section 8 explains a limitation in how `t_enq` is measured. Read it before
-quoting any deployable number.
+Section 8 explains why the original `t_enq`-only results are retained as legacy
+references and why new accuracy numbers require a cluster rerun.
 
 ---
 
@@ -222,7 +576,7 @@ pip install -r requirements.txt
 python -m pytest calibration -q
 ```
 
-Expect 105 tests to pass.
+Expect the full calibration test suite to pass.
 
 The first line says `python3` because many systems ship no bare `python`. Every
 later command says `python`, which the activated virtualenv always provides. If
@@ -480,15 +834,20 @@ stage 1 never captured. First, `T_adm`, which needs a timestamp at enqueue, not
 just at scheduling. Second, the queue and KV state a deployable estimator sees,
 so its online prediction can be replayed faithfully offline.
 
-**What was instrumented.** `calibration/admission/sitecustomize.py` keeps both
-stage-1 patches and adds a third, plus two per-step fields.
+**What is instrumented now.** `calibration/admission/sitecustomize.py` writes
+capture schema 2.
 
-- `Scheduler.add_request` is patched to stamp `t_enq` with `time.perf_counter()`
-  and write one enqueue event carrying `req_id`, `t_enq` and `prompt_len`.
-- Each step row gains `waiting_count`, an exact count of the waiting queue, and
-  `waiting_ids`, the leading ids capped at 512. The count stays exact even when
-  the id list truncates, so queue depth is never wrong. It also gains
-  `free_kv_blocks`, read from `kv_cache_manager.block_pool.get_num_free_blocks()`.
+- `EngineCore.preprocess_add_request` stamps `t_engine_arrive` in the input
+  socket thread before `EngineCoreProc.input_queue`. `Scheduler.add_request`
+  retains the later `t_enq`, so `engine_input_wait = t_enq - t_engine_arrive`
+  directly measures the wait the original probe missed.
+- Each step records every running request's prompt, computed tokens, current
+  scheduled grant and estimated KV blocks. Waiting-request detail is capped at
+  512, but the uncapped queue count, prompt/computed/cached tokens, remaining
+  prefill work, and full-prompt KV demand are aggregated exactly.
+- `free_kv_blocks` is read after scheduling from vLLM's block pool. Together
+  with `max_num_batched_tokens` and `max_num_seqs` in `meta.json`, this is enough
+  to replay the scheduler's token, slot, and KV gates.
 
 A deployable estimator's whole input is a snapshot of occupancy, so the replay is
 only as faithful as these fields.
@@ -496,11 +855,13 @@ only as faithful as these fields.
 **What was collected.** `admission_events.jsonl`, one row per enqueue:
 
 ```json
-{"req_id": "cmpl-...", "t_enq": 2956240.113, "prompt_len": 256}
+{"req_id":"cmpl-...","t_engine_arrive":2956240.094,"t_enq":2956240.113,
+ "engine_input_wait":0.019,"prompt_len":256}
 ```
 
-and `trajectory.jsonl` as in stage 1 with the three extra fields. The run
-produced 290,300 steps and 34,800 enqueue events across two process lifetimes.
+and `trajectory.jsonl` as in stage 1 with the scheduler-work snapshots. The
+original schema-v1 run produced 290,300 steps and 34,800 enqueue events across
+two process lifetimes; it does not contain these new fields.
 
 **The workload.** The same five archetypes, plus one fixed-rate job intended to
 build a standing backlog. Section 9c records that the dedicated overload job
@@ -516,15 +877,18 @@ oc apply -f calibration/deploy/vllm-70b-tp4-admission.yaml
 oc logs deploy/vllm-cal -n vramani-perfcal | grep ADMISSION       # gate
 ```
 
-The gate line must name all three patches. Then confirm `meta.json` carries
-`async_scheduling` false and a positive `block_size`. The offline reconstruction
-divides by `block_size` to get per-request KV blocks, so a missing or zero value
-makes every estimate wrong.
+The gate line must name all four patches. Then confirm `meta.json` carries
+`admission_capture_schema: 2`, the named upstream arrival probe,
+`async_scheduling: false`, and a positive `block_size`. The offline
+reconstruction divides by `block_size` to get per-request KV blocks, so a
+missing or zero value makes every estimate wrong.
 
 Send one request and read five rows of each file by hand before spending GPU
-time. Every trajectory row needs `waiting_count` and `free_kv_blocks`. Every
-event row needs `t_enq`. A missing field means the live-path assumption is wrong
-for your vLLM build, and a full sweep on that assumption wastes hours.
+time. Every trajectory row needs `waiting_count`, `free_kv_blocks`,
+`running_reqs`, `waiting_reqs`, and `waiting_work`. Every event row needs both
+`t_engine_arrive` and `t_enq`, with a nonnegative `engine_input_wait`. A missing
+field means the live-path assumption is wrong for your vLLM build, and a full
+sweep on that assumption wastes hours.
 
 ```bash
 bash calibration/admission/run_sweep.sh
@@ -540,11 +904,13 @@ to the cluster.
 
 ```bash
 python -m calibration.admission.ttft_driver \
-  --trajectory /mnt/pvc/admission/trajectory.jsonl \
-  --events     /mnt/pvc/admission/admission_events.jsonl \
-  --meta       /mnt/pvc/admission/meta.json \
+  --trajectory /mnt/pvc/admission-v2/trajectory.jsonl \
+  --events     /mnt/pvc/admission-v2/admission_events.jsonl \
+  --meta       /mnt/pvc/admission-v2/meta.json \
   --coeffs     coeffs.json \
+  --estimator  token_rollforward \
   --out-rows   figures/ttft_rows.json \
+  --out-censored figures/ttft_censored.json \
   --out-dir    calibration/admission
 ```
 
@@ -571,8 +937,12 @@ Three implementation notes, each a deliberate choice.
   requests. The driver reports the count as `censored_excluded`. This is why the
   pooled row file holds 30,734 rows while the oracle-only views in
   `ttft_seg2.json` cover more.
+- A request enqueued but never scheduled is a right-censored observation, not a
+  missing row with zero delay. The driver writes it to `ttft_censored.json` with
+  the lower bound `capture_end - t_arrive` and excludes that bound from MAPE.
 
-**What to expect.** `figures/plot_ttft_full.py` prints:
+**Legacy reference only.** On the original schema-v1 capture,
+`figures/plot_ttft_full.py` prints:
 
 ```
 n 30734
@@ -584,9 +954,23 @@ deploy queued (4112, -89.27, 86.99)
 
 reading as count, median bias percent, MAPE percent.
 
+Those values validate reproducibility of the old capture, not the six model
+improvements above. Real vLLM accuracy for `token_rollforward` is intentionally
+not claimed until the cluster experiment is rerun with schema 2.
+
 ---
 
 ## 8. Where the composed error lives
+
+**How to read MAPE.** MAPE is the mean, over completed requests, of
+`abs(predicted - realized) / realized * 100`. It is easy to compare across
+latency scales, but it becomes unstable when realized admission delay is near
+zero and it says nothing about right-censored requests. The reports retain MAPE
+for comparison with the original figure, but also emit MAE, median and p90
+absolute percentage error, WAPE (total absolute error divided by total realized
+latency), signed median bias, and the fraction of censored predictions already
+below their observed lower bounds. MAPE should not be the sole admission-model
+claim; for composed TTFT it is useful alongside these tail and absolute metrics.
 
 The oracle variant reaches 7.9% MAPE and the deployable variant 57.5%. Both use
 the identical compute term, so the entire difference is `T_adm`.
@@ -613,23 +997,21 @@ the oracle carries a residual median 11 microseconds the other does not. The
 compute term therefore already carries oracle fidelity for 87% of requests, and
 the deployable gap on that subset is the admission estimate alone.
 
-**Probe placement.** The realized admission delay on the un-queued subset has
+**Legacy probe diagnosis.** In the schema-v1 capture, realized admission delay on the un-queued subset has
 median 11 microseconds, with 85% of requests under 0.1 ms and p99 at 1.44 ms. A
 step occupies the GPU for about 20 ms, so a request arriving mid-iteration cannot
 physically be admitted in 11 microseconds. If `t_enq` were an arrival instant
 independent of the engine's rhythm, the delay would spread across the whole
 iteration and the median would sit near 10 ms.
 
-The explanation is that `t_enq` is synchronized to the step boundary.
-`calibration/admission/sitecustomize.py:112` patches `Scheduler.add_request`, and
-vLLM V1's engine loop drains its input queue and then calls `schedule()`
-immediately. So the real wait divides into two parts and we measure only the
-second.
+The explanation is that the old `t_enq` is synchronized to the step boundary.
+vLLM V1's busy loop drains its input queue and then calls `schedule()`
+immediately. Thus the legacy capture measured the scheduler-queue wait but
+missed the preceding wait for an in-flight GPU iteration.
 
 - **Part one** waits in the EngineCore input queue for the in-flight iteration to
-  drain. Our probe cannot see it. This is what the estimator's floor models,
-  since `floored_t_adm` in `estimators.py:9` raises any estimate to one full
-  iteration.
+  drain. Schema 1 cannot see it. Schema 2 stamps `t_engine_arrive` before that
+  queue and retains `t_enq`, measuring both parts directly.
 - **Part two** waits in the scheduler's waiting queue for a slot or KV space. We
   measure this. It is near zero for un-queued requests and seconds for the tail.
 
@@ -643,15 +1025,13 @@ placed probe would give:
 | plus a uniform draw on [0, `T_iter`] | 25.1% | +17.5% |
 | plus `T_iter`, an upper bound | 6.0% | +4.3% |
 
-A correctly placed probe puts the deployable bulk between roughly 6% and 23%
-rather than 53%. Quote 23% as the defensible figure, since the mean arrival phase
-within an iteration is `T_iter`/2. This correction models the missing quantity
-rather than measuring it. Only a re-run with the probe moved upstream settles it,
-by additionally patching the EngineCore input-queue put and emitting an arrival
-timestamp alongside `t_enq`. Keeping both timestamps would make the new capture a
-superset, so the committed reference reports still reconcile.
+A correctly placed probe was therefore expected to put the deployable bulk
+between roughly 6% and 23% rather than 53%, but that table is a counterfactual,
+not a validation result. The schema-v2 rerun will replace it with a measured
+number. The new estimator charges only the predicted residual of the in-flight
+iteration, rather than always charging a full iteration.
 
-**The queued tail does not improve.** It stays near 87%, and zeroing the
+**The legacy queued tail does not improve.** It stays near 87%, and zeroing the
 admission term makes it slightly worse at 89.7%. That error survives every
 counterfactual, so it is not a measurement artifact. The estimator sees the depth
 of the waiting queue but not the volume of chunked-prefill work already committed
@@ -659,6 +1039,15 @@ ahead of the request, so it cannot anticipate a multi-second stall. A router
 trusting it will treat admission as nearly free when slots are open, which is
 correct, and will underestimate the cost of routing into a prefill-saturated
 pool, which is the documented blind spot.
+
+`token_rollforward` addresses that blind spot by requiring an empty queue and
+available token budget before the immediate path, retaining queued prompt/cache/
+KV work, and simulating vLLM's actual running-first then FIFO-waiting scheduling
+order. It recomputes batch composition and `T_iter` each step until the target is
+admitted. The 3,083 schema-v1 requests that were enqueued but never scheduled
+(1,608 in one process segment and 1,475 in the other) are now reported as
+right-censored lower bounds instead of disappearing from tail reporting. None of
+these changes has a new real-engine accuracy number until schema 2 is collected.
 
 ---
 

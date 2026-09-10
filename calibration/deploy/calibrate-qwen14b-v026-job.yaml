@@ -1,0 +1,68 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: calibrate-qwen14b-v026
+  namespace: vramani-perfcal
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: vllm-cal-qwen14b-v026
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: client
+          image: python:3.11-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - pip install --no-cache-dir httpx numpy && python /code/client.py
+          env:
+            - name: HOME
+              value: /tmp
+            - name: VLLM_BASE
+              value: http://vllm-cal-qwen14b-v026:8000
+            - name: MODEL
+              value: Qwen/Qwen3-14B
+            - name: CHUNK_BUD
+              value: "2048"
+            - name: RESULT_DIR
+              value: /results/qwen3-14b-tp1-vllm-0.26.0/stage0-compat
+            - name: SEED
+              value: "0"
+            - name: DECODE_BATCHES
+              value: 1,2,4,8,16,32
+            - name: DECODE_CONTEXTS
+              value: 64,256,1024,4096
+            - name: DECODE_MAX_TOKENS
+              value: "256"
+            - name: PREFILL_LENGTHS
+              value: 64,128,256,512,1024,2048,4096,8192,16000
+            - name: PREFILL_REPEATS
+              value: "3"
+            - name: MIXED_BATCHES
+              value: 8,16,32
+            - name: MIXED_CONTEXT
+              value: "1024"
+            - name: MIXED_INJECT
+              value: "16000"
+            - name: MIXED_MAX_TOKENS
+              value: "256"
+            - name: MIXED_REPEATS
+              value: "3"
+          volumeMounts:
+            - name: code
+              mountPath: /code
+            - name: results
+              mountPath: /results
+      volumes:
+        - name: code
+          configMap:
+            name: calibrate-qwen14b-v026-code
+        - name: results
+          persistentVolumeClaim:
+            claimName: cal-results-pvc

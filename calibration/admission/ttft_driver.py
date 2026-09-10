@@ -50,19 +50,20 @@ Equations, tagged as in README.md
          deployable  T_adm := the roll-forward estimator the router runs online,
                      replayed by calibration.admission.analysis.replay.
 
-(E5) Realized quantities. t_enq is the enqueue timestamp, t_sched is t_start of
-     the first step in which the request appears, and t_first is t_start of the
-     first step in which computed_r >= prompt_len_r (the step at which its
-     prefill has completed and the first token exists). Then
+(E5) Realized quantities. t_arrive is the earliest EngineCore-side arrival
+     timestamp, t_sched is t_start of the first step in which the request
+     appears, and t_first is t_start of the first step in which computed_r >=
+     prompt_len_r (the step at which its prefill has completed and the first
+     token exists). Then
 
-         T_adm_realized = t_sched - t_enq,
+         T_adm_realized = t_sched - t_arrive,
          prefill_realized = t_first - t_sched,
-         TTFT_realized  = t_first - t_enq.
+         TTFT_realized  = t_first - t_arrive.
 
-     Note that t_enq is stamped in a Scheduler.add_request patch. vLLM V1 drains
-     its EngineCore input queue and then calls schedule(), so T_adm_realized
-     excludes the wait for the in-flight iteration to finish. See the
-     "Probe placement" section of README.md.
+     Schema-v2 captures stamp t_engine_arrive in
+     EngineCore.preprocess_add_request, before the input queue, and retain the
+     later Scheduler.add_request t_enq for decomposition. Schema-v1 captures
+     lack the upstream timestamp and therefore fall back to t_enq.
 
 Process restarts
 ----------------
@@ -76,9 +77,9 @@ and treats each segment independently. Segment count is discovered, not assumed.
 Usage
 -----
     python -m calibration.admission.ttft_driver \
-        --trajectory /mnt/pvc/admission/trajectory.jsonl \
-        --events     /mnt/pvc/admission/admission_events.jsonl \
-        --meta       /mnt/pvc/admission/meta.json \
+        --trajectory /mnt/pvc/admission-v2/trajectory.jsonl \
+        --events     /mnt/pvc/admission-v2/admission_events.jsonl \
+        --meta       /mnt/pvc/admission-v2/meta.json \
         --coeffs     coeffs.json \
         --out-rows   figures/ttft_rows.json \
         --out-dir    calibration/admission
@@ -221,20 +222,29 @@ def add_step_deltas(steps):
 
 
 def events_by_id(event_records):
-    """Collapse enqueue-event records to {req_id: {t_enq, prompt_len}}, last wins.
+    """Collapse enqueue-event records to {req_id: event}, last write wins.
 
     Same semantics as calibration.admission.analysis.parse_enqueue_events, applied
     to an already-segmented record list.
     """
-    return {r["req_id"]: {"t_enq": r["t_enq"], "prompt_len": r["prompt_len"]}
-            for r in event_records}
+    out = {}
+    for record in event_records:
+        event = dict(record)
+        req_id = event.pop("req_id")
+        out[req_id] = event
+    return out
+
+
+def event_time(event):
+    """Earliest comparable engine-side arrival timestamp in an event row."""
+    return event.get("t_engine_arrive", event["t_enq"])
 
 
 # ---------------------------------------------------------------------------
 # Enqueue bucketing.
 # ---------------------------------------------------------------------------
 def bisect_enqueue_bucket(steps, enq_events):
-    """Bracket each request's t_enq into the step whose [t_start, t_end_next)
+    """Bracket each request's arrival into the step whose [t_start, t_end_next)
     contains it.
 
     Semantically identical to calibration.admission.analysis.enqueue_bucket, and
@@ -265,9 +275,9 @@ def bisect_enqueue_bucket(steps, enq_events):
     bucket = {}
     dropped = 0
     for req_id, enq in enq_events.items():
-        t_enq = enq["t_enq"]
-        i = bisect.bisect_right(starts, t_enq) - 1
-        if i < 0 or t_enq >= steps[i]["t_end_next"]:
+        arrival = event_time(enq)
+        i = bisect.bisect_right(starts, arrival) - 1
+        if i < 0 or arrival >= steps[i]["t_end_next"]:
             dropped += 1
         else:
             bucket[req_id] = steps[i]
@@ -309,7 +319,8 @@ def first_token_times(steps):
 # ---------------------------------------------------------------------------
 # Composition (E4).
 # ---------------------------------------------------------------------------
-def compose_segment(steps, enq_events, meta, coeffs, estimator_name, seg_index):
+def compose_segment(steps, enq_events, meta, coeffs, estimator_name, seg_index,
+                    censored_out=None):
     """Reconstruct realized and predicted first-token time for one segment.
 
     Returns (rows, diag). Each row carries the fields figures/plot_ttft_full.py
@@ -327,9 +338,10 @@ def compose_segment(steps, enq_events, meta, coeffs, estimator_name, seg_index):
 
     A row is emitted only where every term is defined, so both parity series
     cover the same request set. That requires the request to be enqueued,
-    bracketed into a step, actually scheduled, uncensored (the deployable replay
-    excludes requests still running at capture end), and to have reached its
-    first token.
+    bracketed into a step, actually scheduled, and to have reached its first
+    token. A request whose later departure is beyond capture end remains
+    scoreable: its admission and first-token times are already observed, and
+    the deployable replay does not use its eventual output length.
     """
     from calibration.admission import analysis as A
 
@@ -352,10 +364,64 @@ def compose_segment(steps, enq_events, meta, coeffs, estimator_name, seg_index):
         replay_rows, never_scheduled = A.replay(
             steps, enq_events, traces, meta, coeffs,
             estimator_name=estimator_name, use_oracle=False,
-            load_of=lambda rid: "all")
+            load_of=lambda rid: "all", include_censored=True)
     finally:
         A.enqueue_bucket = orig_bucket
-    t_adm_deploy = {r["req_id"]: r["predicted"] for r in replay_rows}
+    t_adm_deploy = {r["req_id"]: r["predicted"] for r in replay_rows
+                    if not r.get("right_censored")}
+    t_first_deploy = {r["req_id"]: r["predicted_first_token"]
+                      for r in replay_rows
+                      if not r.get("right_censored")
+                      and r.get("predicted_first_token") is not None}
+    censored_predictions = {r["req_id"]: r["predicted"] for r in replay_rows
+                            if r.get("right_censored")}
+    censored_first_token = {
+        r["req_id"]: r["predicted_first_token"] for r in replay_rows
+        if r.get("right_censored")
+        and r.get("predicted_first_token") is not None}
+
+    # Requests that never entered a scheduled batch have no realized TTFT.  Do
+    # not silently discard them or pretend the capture-end bound is an exact
+    # observation: emit one explicitly right-censored row per request.
+    capture_end = steps[-1]["t_end_next"]
+    censored_rows = []
+    for req_id in bucket:
+        if req_id in traces:
+            continue
+        arrival = event_time(enq_events[req_id])
+        lower_bound = max(capture_end - arrival, 0.0)
+        prompt_len = int(enq_events[req_id]["prompt_len"])
+        arrival_batch = [r for r in bucket[req_id]["reqs"]
+                         if r["id"] != req_id]
+        compute = (n_chunks(prompt_len, kappa)
+                   * A.predict_step(arrival_batch, coeffs)
+                   + prefill_work(prompt_len, kappa, coeffs))
+        t_adm_predicted = censored_predictions.get(req_id)
+        p_deploy_composed = (t_adm_predicted + compute
+                             if t_adm_predicted is not None else None)
+        p_deploy = censored_first_token.get(req_id, p_deploy_composed)
+        censored_rows.append({
+            "seg": seg_index,
+            "req_id": req_id,
+            "arrival": arrival,
+            "capture_end": capture_end,
+            "r_tadm_lower_bound": lower_bound,
+            "r_ttft_lower_bound": lower_bound,
+            "t_adm_deploy": t_adm_predicted,
+            "compute": compute,
+            "p_deploy": p_deploy,
+            "p_deploy_composed": p_deploy_composed,
+            "p_deploy_rollout": censored_first_token.get(req_id),
+            "prediction_below_lower_bound": (
+                p_deploy < lower_bound if p_deploy is not None else None),
+            "known_underprediction_lower_bound": (
+                max(lower_bound - p_deploy, 0.0)
+                if p_deploy is not None else None),
+            "censoring": "right",
+            "reason": "enqueued_but_never_scheduled",
+        })
+    if censored_out is not None:
+        censored_out.extend(censored_rows)
 
     rows = []
     missing_first_token = 0
@@ -367,7 +433,7 @@ def compose_segment(steps, enq_events, meta, coeffs, estimator_name, seg_index):
             continue
         enq = enq_events[req_id]
         prompt_len = enq["prompt_len"]
-        t_enq = enq["t_enq"]
+        arrival = event_time(enq)
         t_sched = traces[req_id]["t_sched"]
 
         n_c = n_chunks(prompt_len, kappa)
@@ -382,30 +448,45 @@ def compose_segment(steps, enq_events, meta, coeffs, estimator_name, seg_index):
             self_in_arrival_batch += 1
         t_iter = A.predict_step(arrival_batch, coeffs)
         compute = n_c * t_iter + prefill_work(prompt_len, kappa, coeffs)
+        p_deploy_composed = dep + compute
+        p_deploy_rollout = t_first_deploy.get(req_id)
 
         rows.append({
             "seg": seg_index,
             "req_id": req_id,
             "nc": n_c,
             "prompt_len": prompt_len,
-            "r_ttft": t_first - t_enq,
-            "r_tadm": t_sched - t_enq,
+            "r_ttft": t_first - arrival,
+            "r_tadm": t_sched - arrival,
             "r_prefill": t_first - t_sched,
             "compute": compute,
             "t_adm_deploy": dep,
-            "p_oracle": (t_sched - t_enq) + compute,
-            "p_deploy": dep + compute,
+            "p_oracle": (t_sched - arrival) + compute,
+            "p_deploy": (p_deploy_rollout
+                         if p_deploy_rollout is not None
+                         else p_deploy_composed),
+            "p_deploy_composed": p_deploy_composed,
+            "p_deploy_rollout": p_deploy_rollout,
+            "t_engine_arrive": enq.get("t_engine_arrive"),
+            "t_enq": enq["t_enq"],
+            "engine_input_wait": enq.get(
+                "engine_input_wait",
+                max(enq["t_enq"] - arrival, 0.0)
+                if "t_engine_arrive" in enq else None),
         })
 
     # Requests the deployable replay declined to score, itemized so the row count
-    # reconciles against the enqueue-event count. Censored requests are the
-    # largest such class: they were scheduled and may well have produced a first
-    # token, but they were still running when the capture ended, so the replay has
-    # no departure for them and emits no deployable estimate. Scoring them under
-    # the oracle variant alone would leave the two parity series covering
-    # different request sets, so they are dropped from both.
+    # reconciles against the enqueue-event count. Scheduled requests that are
+    # still running at capture end are deliberately replayed above: departure is
+    # irrelevant once admission and first token have both been observed.
     censored_excluded = sum(1 for rid in bucket
-                            if rid in traces and traces[rid]["censored"])
+                            if rid in traces and traces[rid]["censored"]
+                            and rid not in t_adm_deploy)
+    censored_bounds = sorted(r["r_tadm_lower_bound"] for r in censored_rows)
+    predicted_censored = [r for r in censored_rows if r["p_deploy"] is not None]
+    violations = sum(r["prediction_below_lower_bound"] for r in predicted_censored)
+    known_shortfalls = sorted(
+        r["known_underprediction_lower_bound"] for r in predicted_censored)
 
     rows.sort(key=lambda r: r["r_ttft"])
     diag = {
@@ -417,6 +498,20 @@ def compose_segment(steps, enq_events, meta, coeffs, estimator_name, seg_index):
         "estimator": estimator_name,
         "dropped_unbracketed": dropped_unbracketed,
         "never_scheduled": never_scheduled,
+        "right_censored": {
+            "n": len(censored_rows),
+            "lower_bound_s_p50": _percentile(censored_bounds, 50),
+            "lower_bound_s_p90": _percentile(censored_bounds, 90),
+            "prediction_n": len(predicted_censored),
+            "prediction_below_lower_bound_n": violations,
+            "prediction_below_lower_bound_frac": (
+                violations / len(predicted_censored)
+                if predicted_censored else None),
+            "known_underprediction_s_p50": _percentile(known_shortfalls, 50),
+            "known_underprediction_s_p90": _percentile(known_shortfalls, 90),
+            "note": ("lower bounds are excluded from MAPE; a prediction below "
+                     "its bound is a proven underprediction"),
+        },
         "censored_excluded": censored_excluded,
         "skipped_already_decoding": len(skipped_already_decoding),
         "skipped_no_first_token": missing_first_token,
@@ -447,10 +542,15 @@ def view_stats(pairs):
     if not pairs:
         return {"n": 0, "median_ratio": None, "bias_pct": None, "mape_pct": None,
                 "over_pred_frac": None, "realized_ms_p50": None,
-                "realized_ms_p90": None, "pred_ms_p50": None}
+                "realized_ms_p90": None, "pred_ms_p50": None,
+                "mae_ms": None, "median_ape_pct": None,
+                "p90_ape_pct": None, "wape_pct": None}
     ratios = sorted(r / p for r, p in pairs if p > 0)
     med = _percentile(ratios, 50)
     mape = sum(abs(p - r) / r for r, p in pairs) / len(pairs) * 100.0
+    abs_errors = sorted(abs(p - r) for r, p in pairs)
+    apes = sorted(abs(p - r) / r * 100.0 for r, p in pairs)
+    wape = sum(abs_errors) / sum(r for r, _ in pairs) * 100.0
     over = sum(1 for r, p in pairs if p > r) / len(pairs)
     realized = sorted(r for r, _ in pairs)
     predicted = sorted(p for _, p in pairs)
@@ -463,6 +563,10 @@ def view_stats(pairs):
         "realized_ms_p50": round(_percentile(realized, 50) * 1000.0, 3),
         "realized_ms_p90": round(_percentile(realized, 90) * 1000.0, 2),
         "pred_ms_p50": round(_percentile(predicted, 50) * 1000.0, 3),
+        "mae_ms": round(sum(abs_errors) / len(abs_errors) * 1000.0, 3),
+        "median_ape_pct": round(_percentile(apes, 50), 1),
+        "p90_ape_pct": round(_percentile(apes, 90), 1),
+        "wape_pct": round(wape, 1),
     }
 
 
@@ -489,6 +593,10 @@ def summarize(rows, diag, queued_threshold=0.5):
         "n_rows": len(rows),
         "n_c_histogram": dict(sorted(hist.items(), key=lambda kv: int(kv[0]))),
         "diagnostics": diag,
+        "right_censored": diag.get("right_censored", {
+            "n": 0, "lower_bound_s_p50": None, "lower_bound_s_p90": None,
+            "note": "lower bounds are excluded from MAPE",
+        }),
         "prefill_only": view(rows, "r_prefill", "compute"),
         "prefill_only.not_queued": view(nq, "r_prefill", "compute"),
         "prefill_only.queued_gt500ms": view(qd, "r_prefill", "compute"),
@@ -507,11 +615,13 @@ def main(argv=None):
     ap.add_argument("--meta", required=True, help="meta.json from the capture")
     ap.add_argument("--coeffs", required=True, help="frozen coeffs.json")
     ap.add_argument("--estimator", default="rollforward",
-                    choices=["rollforward", "fluid"],
+                    choices=["token_rollforward", "rollforward", "fluid"],
                     help="deployable estimator to replay (default rollforward)")
     ap.add_argument("--out-rows", required=True,
                     help="pooled per-request rows, consumed by plot_ttft_full.py")
     ap.add_argument("--out-dir", required=True, help="directory for ttft_seg*.json")
+    ap.add_argument("--out-censored", default=None,
+                    help="pooled right-censored rows (default OUT_DIR/ttft_censored.json)")
     ap.add_argument("--segment", type=int, default=None,
                     help="process only this 1-based segment (lower peak memory)")
     ap.add_argument("--slim-rows", action="store_true",
@@ -536,13 +646,15 @@ def main(argv=None):
 
     os.makedirs(a.out_dir, exist_ok=True)
     all_rows = []
+    all_censored = []
     n_seg = min(len(traj_segments), len(evt_segments))
     for i in range(n_seg):
         seg_index = i + 1
         if a.segment is not None and seg_index != a.segment:
             continue
         rows, diag = compose_segment(traj_segments[i], events_by_id(evt_segments[i]),
-                                     meta, coeffs, a.estimator, seg_index)
+                                     meta, coeffs, a.estimator, seg_index,
+                                     censored_out=all_censored)
         report = summarize(rows, diag)
         path = os.path.join(a.out_dir, f"ttft_seg{seg_index}.json")
         with open(path, "w") as f:
@@ -561,6 +673,11 @@ def main(argv=None):
     with open(a.out_rows, "w") as f:
         json.dump(out_rows, f)
     print(f"wrote {len(out_rows)} pooled rows -> {a.out_rows}")
+    censored_path = a.out_censored or os.path.join(a.out_dir, "ttft_censored.json")
+    os.makedirs(os.path.dirname(os.path.abspath(censored_path)), exist_ok=True)
+    with open(censored_path, "w") as f:
+        json.dump(all_censored, f)
+    print(f"wrote {len(all_censored)} right-censored rows -> {censored_path}")
     return 0
 
 

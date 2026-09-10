@@ -20,9 +20,9 @@ ARCHETYPES=(
 for a in "${ARCHETYPES[@]}"; do
   IFS=: read -r name isl osl <<<"$a"
   data="prompt_tokens=${isl},prompt_tokens_min=${isl},prompt_tokens_max=${isl},output_tokens=${osl},output_tokens_min=${osl},output_tokens_max=${osl},random_seed=0"
-  outdir="/results/guidellm-admission/${name}-i${isl}-o${osl}"
+  outdir="/results/guidellm-admission-v2/${name}-i${isl}-o${osl}"
   echo "# ${name} (ISL ${isl} / OSL ${osl})"
-  echo "sed -e 's#__GUIDELLM_DATA__#${data}#' -e 's#__GUIDELLM_OUTPUT_DIR__#${outdir}#' -e 's#guidellm-sweep-admission#guidellm-sweep-admission-${name}#' ${TPL} | oc apply -n ${NS} -f -"
+  echo "sed -e 's#__GUIDELLM_DATA__#${data}#' -e 's#__GUIDELLM_OUTPUT_DIR__#${outdir}#' -e 's#guidellm-sweep-admission-v2#guidellm-sweep-admission-v2-${name}#' ${TPL} | oc apply -n ${NS} -f -"
 done
 
 # Overload extension: fixed --profile constant rate ABOVE the sweep's observed

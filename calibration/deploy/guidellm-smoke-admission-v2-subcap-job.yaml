@@ -1,0 +1,66 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: guidellm-smoke-admission-v2-subcap
+  namespace: vramani-perfcal
+  labels:
+    experiment: cal-validate-70b-v2-smoke
+    load: subcap
+spec:
+  template:
+    metadata:
+      labels:
+        experiment: cal-validate-70b-v2-smoke
+        load: subcap
+    spec:
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: vllm-cal
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - name: guidellm
+        image: ghcr.io/vllm-project/guidellm:v0.5.4
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            mkdir -p "$GUIDELLM_OUTPUT_DIR"
+            guidellm benchmark run \
+              --target "$GUIDELLM_TARGET" \
+              --profile constant \
+              --rate 6 \
+              --max-seconds 60 \
+              --data "$GUIDELLM_DATA" \
+              --request-type text_completions \
+              --output-dir "$GUIDELLM_OUTPUT_DIR" \
+              --outputs csv,json
+        env:
+        - name: HF_HOME
+          value: /tmp
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token-secret
+              key: token
+        - name: GUIDELLM_TARGET
+          value: http://vllm-cal:8000
+        - name: GUIDELLM_DATA
+          value: prompt_tokens=256,prompt_tokens_min=256,prompt_tokens_max=256,output_tokens=512,output_tokens_min=512,output_tokens_max=512,random_seed=0
+        - name: GUIDELLM_OUTPUT_DIR
+          value: /results/guidellm-admission-v2/smoke-subcap-i256-o512-r6
+        volumeMounts:
+        - name: results
+          mountPath: /results
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      restartPolicy: Never
+      volumes:
+      - name: results
+        persistentVolumeClaim:
+          claimName: cal-results-pvc
+  backoffLimit: 2

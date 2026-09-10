@@ -1,0 +1,40 @@
+{
+  "model": "Qwen/Qwen3-14B",
+  "seed": 0,
+  "chunk_bud": 2048,
+  "decode_batches": [
+    1,
+    2,
+    4,
+    8
+  ],
+  "decode_contexts": [
+    8192,
+    16000
+  ],
+  "decode_max_tokens": 256,
+  "decode_warmup_tokens": 4,
+  "prefill_lengths": [
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16000
+  ],
+  "prefill_repeats": 10,
+  "mixed_batches": [
+    4,
+    8,
+    16,
+    32
+  ],
+  "mixed_context": 4096,
+  "mixed_inject": 16000,
+  "mixed_max_tokens": 256,
+  "mixed_repeats": 5,
+  "mixed_warmup_s": 1.0
+}

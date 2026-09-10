@@ -1,0 +1,20 @@
+{
+  "captured_at": "2026-09-08",
+  "namespace": "vramani-perfcal",
+  "node": "pokprod-b93r38s3",
+  "gpu_product": "NVIDIA-H100-80GB-HBM3",
+  "model": "Qwen/Qwen3-14B",
+  "model_revision": "40c069824f4251a91eefaf281ebe4c544efd3e18",
+  "tensor_parallel_size": 1,
+  "vllm_version": "0.26.0",
+  "vllm_image": "docker.io/vllm/vllm-openai@sha256:770fe65b2c73ee74a5c42165cf3433de4048cc2cd9c57a937ca4e35aba5aa87b",
+  "max_model_len": 32768,
+  "max_num_seqs": 256,
+  "max_num_batched_tokens": 2048,
+  "block_size": 16,
+  "chunked_prefill": true,
+  "prefix_caching": false,
+  "gpu_memory_utilization": 0.92,
+  "kv_cache_memory_gib": 43.61,
+  "kv_cache_tokens": 285808
+}

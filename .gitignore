@@ -19,3 +19,8 @@ figures/ttft_error_decomposition.json
 /trajectory.jsonl
 /admission_events.jsonl
 /meta.json
+
+# Local schema-v2 admission smoke captures. The uncompressed trajectories are
+# hundreds of MiB and are exploratory artifacts, not the validated coefficient
+# datasets published under calibration/results/.
+/calibration/admission/results-v2-smoke/

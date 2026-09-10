@@ -160,6 +160,15 @@ def test_split_on_reset_single_segment_when_monotone():
     assert len(D.split_on_reset(recs, "t_start", step_key="step")) == 1
 
 
+def test_events_by_id_preserves_schema_v2_arrival_fields():
+    events = D.events_by_id([{
+        "req_id": "A", "t_engine_arrive": 0.25, "t_enq": 0.5,
+        "engine_input_wait": 0.25, "prompt_len": 150,
+    }])
+    assert events["A"]["t_engine_arrive"] == pytest.approx(0.25)
+    assert events["A"]["engine_input_wait"] == pytest.approx(0.25)
+
+
 # ---------------------------------------------------------------------------
 # add_step_deltas parity with the frozen parser.
 # ---------------------------------------------------------------------------
@@ -211,6 +220,16 @@ def test_bucket_is_half_open_at_the_upper_edge(fixture_segment):
         steps, {"x": {"t_enq": 1.0, "prompt_len": 10}})
     assert dropped == 0
     assert bucket["x"]["step"] == 1
+
+
+def test_bisect_bucket_prefers_upstream_engine_arrival(fixture_segment):
+    steps, _ = fixture_segment
+    steps = D.add_step_deltas(steps)
+    bucket, dropped = D.bisect_enqueue_bucket(steps, {
+        "x": {"t_engine_arrive": 0.75, "t_enq": 1.25, "prompt_len": 10},
+    })
+    assert dropped == 0
+    assert bucket["x"]["step"] == 0
 
 
 def test_bisect_bucket_rejects_a_non_ascending_segment():
@@ -342,6 +361,38 @@ def test_oracle_composition_is_exactly_realized_admission_plus_compute(fixture_s
         assert row["p_deploy"] - row["compute"] == pytest.approx(row["t_adm_deploy"])
 
 
+def test_compose_segment_measures_from_upstream_engine_arrival(fixture_segment):
+    steps, events = fixture_segment
+    events["A"]["t_engine_arrive"] = 0.25
+    events["A"]["engine_input_wait"] = 0.25
+    rows, _ = D.compose_segment(steps, events, META, COEFFS, "rollforward", 1)
+    assert rows[0]["r_tadm"] == pytest.approx(0.75)
+    assert rows[0]["r_ttft"] == pytest.approx(2.75)
+    assert rows[0]["engine_input_wait"] == pytest.approx(0.25)
+
+
+def test_compose_segment_uses_full_scheduler_rollout_for_schema_v2_ttft(
+        fixture_segment):
+    steps, events = fixture_segment
+    # The arrival bucket is step 0. Schema-v2 snapshots describe its already
+    # scheduled Z decode and the exact empty queue after scheduling.
+    steps[0]["running_reqs"] = [{
+        "id": "Z", "prompt_len": 5, "computed": 5,
+        "scheduled_tokens": 1, "cached_tokens": 0, "kv_blocks_est": 1,
+    }]
+    steps[0]["waiting_reqs"] = []
+    steps[0]["waiting_work"] = {"count": 0, "remaining_prefill_tokens": 0}
+    rows, _ = D.compose_segment(
+        steps, events, META, COEFFS, "token_rollforward", 1)
+    row = rows[0]
+    # Arrival at 0.5 during a predicted 1.15s iteration leaves 0.65s. The
+    # target then runs 100- and 50-token chunks costing 1.6s and 1.675s.
+    assert row["t_adm_deploy"] == pytest.approx(0.65)
+    assert row["p_deploy_rollout"] == pytest.approx(3.925)
+    assert row["p_deploy"] == pytest.approx(row["p_deploy_rollout"])
+    assert row["p_deploy_composed"] == pytest.approx(4.225)
+
+
 def test_compose_segment_tags_the_segment_index(fixture_segment):
     steps, events = fixture_segment
     rows, diag = D.compose_segment(steps, events, META, COEFFS, "rollforward", 7)
@@ -368,11 +419,9 @@ def test_compose_segment_skips_a_request_with_no_first_token():
     assert diag["censored_excluded"] == 0
 
 
-def test_compose_segment_counts_a_censored_request_as_excluded():
-    """A is still running when the capture ends, so the deployable replay has no
-    departure for it and it is dropped from both parity series, not just one.
-    This is the accounting that explains the row-count gap against the
-    oracle-only views in the committed ttft_seg*.json pins."""
+def test_compose_segment_scores_first_token_before_later_departure():
+    """A is still running when capture ends, but admission and first token are
+    observed and the deployable estimate does not need A's eventual output."""
     steps = [
         _step(0, 0.0, [_z(5)]),
         _step(1, 1.0, [_a(0, 100), _z(6)]),
@@ -382,9 +431,41 @@ def test_compose_segment_counts_a_censored_request_as_excluded():
     ]
     events = {"A": {"t_enq": 0.5, "prompt_len": 150}}
     rows, diag = D.compose_segment(steps, events, META, COEFFS, "rollforward", 1)
-    assert rows == [], "a censored request must not be scored under either variant"
-    assert diag["censored_excluded"] == 1
+    assert [row["req_id"] for row in rows] == ["A"]
+    assert rows[0]["r_ttft"] == pytest.approx(2.5)
+    assert diag["censored_excluded"] == 0
     assert diag["skipped_no_first_token"] == 0
+
+
+def test_compose_segment_emits_never_scheduled_as_right_censored(fixture_segment):
+    steps, _ = fixture_segment
+    events = {
+        "Q": {"t_engine_arrive": 0.25, "t_enq": 0.5, "prompt_len": 150},
+    }
+    censored = []
+    rows, diag = D.compose_segment(
+        steps, events, META, COEFFS, "rollforward", 1,
+        censored_out=censored)
+    assert rows == []
+    assert diag["never_scheduled"] == 1
+    assert diag["right_censored"]["n"] == 1
+    assert censored == [{
+        "seg": 1,
+        "req_id": "Q",
+        "arrival": 0.25,
+        "capture_end": 6.0,
+        "r_tadm_lower_bound": 5.75,
+        "r_ttft_lower_bound": 5.75,
+        "t_adm_deploy": pytest.approx(1.15),
+        "compute": pytest.approx(3.575),
+        "p_deploy": pytest.approx(4.725),
+        "p_deploy_composed": pytest.approx(4.725),
+        "p_deploy_rollout": None,
+        "prediction_below_lower_bound": True,
+        "known_underprediction_lower_bound": pytest.approx(1.025),
+        "censoring": "right",
+        "reason": "enqueued_but_never_scheduled",
+    }]
 
 
 def test_compose_segment_handles_an_empty_segment():
@@ -450,7 +531,10 @@ def test_summarize_splits_on_realized_admission_delay(fixture_segment):
         {"seg": 1, "nc": 2, "r_tadm": 10.0, "r_ttft": 10.5, "r_prefill": 0.5,
          "compute": 0.5, "t_adm_deploy": 0.55, "p_oracle": 10.5, "p_deploy": 1.05},
     ]
-    diag = {"kappa": 8192, "estimator": "rollforward"}
+    diag = {"kappa": 8192, "estimator": "rollforward",
+            "right_censored": {"n": 3, "lower_bound_s_p50": 2.0,
+                               "lower_bound_s_p90": 5.0,
+                               "note": "lower bounds are excluded from MAPE"}}
     rep = D.summarize(rows, diag)
     assert rep["n_c_histogram"] == {"1": 1, "2": 1}
     assert rep["ttft_deployable.not_queued"]["n"] == 1
@@ -459,6 +543,7 @@ def test_summarize_splits_on_realized_admission_delay(fixture_segment):
     assert rep["ttft_oracle_tadm"]["n"] == 2
     # prefill_only ignores the admission term, so the queued row scores well there.
     assert rep["prefill_only.queued_gt500ms"]["mape_pct"] == pytest.approx(0.0)
+    assert rep["right_censored"]["n"] == 3
 
 
 def test_summarize_view_keys_match_the_committed_pins():

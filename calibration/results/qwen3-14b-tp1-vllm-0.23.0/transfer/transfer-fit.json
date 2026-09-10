@@ -1,0 +1,14 @@
+{
+  "xfer_base_us": 595.1621949119537,
+  "xfer_bandwidth_decimal_gbps": 12.213979276609022,
+  "xfer_bandwidth_gibps": 11.375154626191614,
+  "r2": 0.9999730287988504,
+  "mape_pct": 0.8151426877303436,
+  "p95_abs_pct_error": 2.817600244564312,
+  "max_abs_pct_error": 3.02493645113405,
+  "all_points": 20,
+  "excluded_leading_points": 3,
+  "fit_points": 17,
+  "size_unit_in_vllm_log": "MiB (despite MB label)",
+  "bandwidth_unit_for_policy": "decimal GB/s"
+}

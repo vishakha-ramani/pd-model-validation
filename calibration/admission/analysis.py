@@ -25,12 +25,14 @@ except ImportError:
 # estimators.py always sits in this same package (both deployment styles),
 # so a package-relative import is unambiguous here (unlike modeb above).
 from .estimators import ESTIMATORS
+from .estimators import estimate_token_rollforward_times
 
 __all__ = [
     "load_meta", "parse_admission_trajectory", "parse_enqueue_events",
     "request_traces", "build_context", "block_accounting_diag",
     "predict_step", "load_coeffs",
     "RunningMean", "deployable_rem_steps_est", "enqueue_bucket", "replay",
+    "admission_censored_rows",
     "admission_report", "write_admission_report",
 ]
 
@@ -73,8 +75,15 @@ def parse_enqueue_events(path):
             if not line:
                 continue
             row = json.loads(line)
-            events[row["req_id"]] = {"t_enq": row["t_enq"], "prompt_len": row["prompt_len"]}
+            event = dict(row)
+            event.pop("req_id", None)
+            events[row["req_id"]] = event
     return events
+
+
+def event_time(enq):
+    """Earliest engine-side arrival time available in this capture version."""
+    return enq.get("t_engine_arrive", enq["t_enq"])
 
 
 def request_traces(steps):
@@ -100,46 +109,164 @@ def request_traces(steps):
     return traces
 
 
-def build_context(step, step_idx, req_id, enq, meta, coeffs, traces, use_oracle, nout_est):
+def build_context(step, step_idx, req_id, enq, meta, coeffs, traces, use_oracle,
+                  nout_est, enq_events=None, output_len_est=None):
     """Assemble the AdmissionContext dict for req_id evaluated at `step`."""
     block_size = _block_size(meta)
     reqs = step["reqs"]
+    running_snapshot = step.get("running_reqs") or reqs
 
     # batch_size = TOTAL occupied sequence slots (every scheduled request,
     # prefill or decode, holds a slot) -- not a decode-only count.
-    batch_size = len(reqs)
+    batch_size = len(running_snapshot)
     max_batch_size = meta["max_num_seqs"]
 
     free_kv_blocks = step.get("free_kv_blocks")
     ctx_extra = {}
     if free_kv_blocks is None:
         free_kv_blocks = meta["num_gpu_blocks"] - sum(
-            math.ceil(r["computed"] / block_size) for r in reqs)
+            math.ceil((r["computed"] + r.get("scheduled_tokens", r.get("kappa", 0)))
+                      / block_size) for r in running_snapshot)
         ctx_extra["free_kv_reconstructed"] = True
 
     req_kv_need = math.ceil(enq["prompt_len"] / block_size)
 
     waiting_ids = step.get("waiting_ids") or []
-    if req_id in waiting_ids:
-        queue_depth = waiting_ids.index(req_id)
-    else:
-        # Truncated snapshot, or a request whose t_enq falls after this
-        # step's waiting snapshot was taken: either way its true position
-        # is unobserved, so fall back to the step's observed waiting_count
-        # as a back-of-queue proxy (replaces the old front-of-queue 0).
-        queue_depth = step["waiting_count"]
-        ctx_extra["queue_pos_from_count"] = True
 
     t_iter = predict_step(reqs, coeffs)
 
+    # ``nout_est`` is already the mean *remaining* lifetime of the current
+    # decode batch.  When the learned total output length is available, retain
+    # it separately so per-request lifetimes do not subtract steps_done twice
+    # and newly admitted requests receive a full output lifetime.
+    output_steps_est = (None if output_len_est is None
+                        else max(float(output_len_est), 1.0))
+    max_decode_steps_done = max((
+        max(int(r.get("computed", 0)) - int(r.get("prompt_len", 0)), 0)
+        for r in running_snapshot
+        if int(r.get("computed", 0)) >= int(r.get("prompt_len", 0))
+    ), default=0)
+    censored_output_steps_est = (
+        max(output_steps_est, max_decode_steps_done)
+        if output_steps_est is not None else None)
+
     running = []
-    for r in reqs:
-        tr = traces[r["id"]]
-        steps_done = step_idx - tr["first_step_idx"]
-        kv_blocks = math.ceil(r["computed"] / block_size)
-        true_remaining = (tr["last_step_idx"] - step_idx) if use_oracle else -1
-        running.append({"steps_done": steps_done, "kv_blocks": kv_blocks,
-                         "true_remaining": true_remaining})
+    for r in running_snapshot:
+        rid = r["id"]
+        tr = traces.get(rid)
+        computed = int(r.get("computed", 0))
+        prompt_len = int(r.get("prompt_len", 0))
+        scheduled_tokens = int(r.get("scheduled_tokens", r.get("kappa", 0)) or 0)
+        steps_done = max(computed - prompt_len, 0)
+        kv_blocks = int(r.get("kv_blocks_est") or math.ceil(
+            (computed + scheduled_tokens) / block_size))
+        # Include the already-scheduled current iteration.  The rollout first
+        # advances that in-flight work, then decrements this count.
+        true_remaining = ((tr["last_step_idx"] - step_idx + 1)
+                          if use_oracle and tr is not None else -1)
+        if computed >= prompt_len:
+            if censored_output_steps_est is not None:
+                remaining_est = max(censored_output_steps_est - steps_done, 1.0)
+            else:
+                remaining_est = max(float(nout_est) - steps_done, 1.0)
+        else:
+            token_cap = max(int(meta.get("max_num_batched_tokens", prompt_len or 1)), 1)
+            chunks_left = math.ceil(max(prompt_len - computed, 0) / token_cap)
+            # nout_est is learned from captured decode records, which begin
+            # after final prefill.  Keep those future decode steps in addition
+            # to every remaining prefill chunk, including the in-flight one.
+            future_decode = (output_steps_est if output_steps_est is not None
+                             else float(nout_est))
+            remaining_est = max(chunks_left + future_decode, 1.0)
+        running.append({
+            "id": rid, "prompt_len": prompt_len, "computed": computed,
+            "scheduled_tokens": scheduled_tokens, "steps_done": steps_done,
+            "kv_blocks": kv_blocks, "true_remaining": true_remaining,
+            "remaining_est": remaining_est,
+        })
+
+    waiting = []
+    for r in step.get("waiting_reqs") or []:
+        waiting.append(dict(r))
+    if not waiting and enq_events is not None:
+        for rid in waiting_ids:
+            ev = enq_events.get(rid)
+            if ev is None:
+                continue
+            waiting.append({
+                "id": rid, "prompt_len": int(ev["prompt_len"]),
+                "computed": int(ev.get("cached_tokens", 0) or 0),
+                "scheduled_tokens": 0, "cached_tokens": ev.get("cached_tokens"),
+                "remaining_prefill_tokens": max(
+                    int(ev["prompt_len"]) - int(ev.get("cached_tokens", 0) or 0), 0),
+                "kv_blocks_est": 0,
+            })
+
+    arrival = event_time(enq)
+    # The scheduler snapshot is taken near the start of the in-flight step.
+    # Requests arriving later in that same step are already ahead of a still
+    # later target in EngineCore's input queue, even though none appears in the
+    # scheduler's waiting deque yet. Recover that FIFO work from event order.
+    known_ids = {r.get("id") for r in running_snapshot}
+    known_ids.update(waiting_ids)
+    pending_input = []
+    if enq_events is not None and req_id not in waiting_ids:
+        for rid, event in enq_events.items():
+            if rid == req_id or rid in known_ids:
+                continue
+            candidate_arrival = event_time(event)
+            if step["t_start"] < candidate_arrival < arrival:
+                cached = int(event.get("cached_tokens", 0) or 0)
+                prompt_len = int(event["prompt_len"])
+                pending_input.append((candidate_arrival, {
+                    "id": rid, "prompt_len": prompt_len,
+                    "computed": cached, "scheduled_tokens": 0,
+                    "cached_tokens": event.get("cached_tokens"),
+                    "remaining_prefill_tokens": max(prompt_len - cached, 0),
+                    "kv_blocks_est": math.ceil(cached / block_size),
+                }))
+        pending_input.sort(key=lambda item: item[0])
+
+    pending_reqs = [record for _, record in pending_input]
+    if req_id in waiting_ids:
+        queue_depth = waiting_ids.index(req_id)
+    else:
+        queue_depth = int(step.get("waiting_count", len(waiting))) + len(pending_reqs)
+        ctx_extra["queue_pos_from_count"] = True
+    ctx_extra["pending_input_count"] = len(pending_reqs)
+
+    waiting_work = dict(step.get("waiting_work") or {
+        "count": step.get("waiting_count", len(waiting)),
+        "remaining_prefill_tokens": sum(
+            max(r.get("prompt_len", 0) - r.get("computed", 0), 0)
+            for r in waiting),
+    })
+    if pending_reqs:
+        waiting_work["count"] = int(waiting_work.get("count", 0)) + len(pending_reqs)
+        waiting_work["prompt_tokens"] = int(waiting_work.get("prompt_tokens", 0)) + sum(
+            r["prompt_len"] for r in pending_reqs)
+        waiting_work["computed_tokens"] = int(
+            waiting_work.get("computed_tokens", 0)) + sum(
+                r["computed"] for r in pending_reqs)
+        waiting_work["cached_tokens_observed"] = int(
+            waiting_work.get("cached_tokens_observed", 0)) + sum(
+                (r["cached_tokens"] or 0) for r in pending_reqs)
+        waiting_work["cached_tokens_missing"] = int(
+            waiting_work.get("cached_tokens_missing", 0)) + sum(
+                r["cached_tokens"] is None for r in pending_reqs)
+        waiting_work["remaining_prefill_tokens"] = int(
+            waiting_work.get("remaining_prefill_tokens", 0)) + sum(
+                r["remaining_prefill_tokens"] for r in pending_reqs)
+        waiting_work["full_prompt_kv_blocks"] = int(
+            waiting_work.get("full_prompt_kv_blocks", 0)) + sum(
+                math.ceil(r["prompt_len"] / block_size) for r in pending_reqs)
+        # Preserve FIFO order exactly when the captured prefix is complete. If
+        # it was capped, _expand_waiting synthesizes the missing older work
+        # ahead of these arrivals from the exact aggregate instead.
+        if not step.get("waiting_truncated", False):
+            waiting.extend(pending_reqs)
+
+    current_iter_elapsed = max(arrival - step["t_start"], 0.0)
 
     ctx = {
         "batch_size": batch_size,
@@ -149,7 +276,26 @@ def build_context(step, step_idx, req_id, enq, meta, coeffs, traces, use_oracle,
         "t_iter": t_iter,
         "queue_depth": queue_depth,
         "remaining_steps_est": nout_est,
+        "output_steps_est": (output_steps_est if output_steps_est is not None
+                             else nout_est),
         "running": running,
+        "waiting": waiting,
+        "waiting_work": waiting_work,
+        "max_num_batched_tokens": meta.get("max_num_batched_tokens", 0),
+        "long_prefill_token_threshold": meta.get("long_prefill_token_threshold", 0),
+        "block_size": block_size,
+        "coeffs": coeffs,
+        "current_iter_elapsed": current_iter_elapsed,
+        "current_iter_remaining": max(t_iter - current_iter_elapsed, 0.0),
+        "target_id": req_id,
+        "target_prompt_len": int(enq["prompt_len"]),
+        "target_cached_tokens": int(enq.get("cached_tokens", 0) or 0),
+        # Only schema-v2 snapshots have the complete running state plus exact
+        # aggregate queued work required by token-level scheduler replay.
+        # Legacy captures retain their bit-for-bit rollforward behavior.
+        "queue_work_observed": (
+            "running_reqs" in step and "waiting_reqs" in step
+            and "waiting_work" in step),
     }
     ctx.update(ctx_extra)
     return ctx
@@ -161,7 +307,8 @@ def block_accounting_diag(step, meta):
     block_size = _block_size(meta)
     captured_free = step.get("free_kv_blocks")
     reconstructed_free = meta["num_gpu_blocks"] - sum(
-        math.ceil(r["computed"] / block_size) for r in step["reqs"])
+        math.ceil((r["computed"] + r.get("scheduled_tokens", r.get("kappa", 0)))
+                  / block_size) for r in (step.get("running_reqs") or step["reqs"]))
     delta = None if captured_free is None else captured_free - reconstructed_free
     return {"captured_free": captured_free, "reconstructed_free": reconstructed_free,
             "delta": delta}
@@ -231,7 +378,7 @@ def enqueue_bucket(steps, enq_events):
     bucket = {}
     dropped = 0
     for req_id, enq in enq_events.items():
-        t_enq = enq["t_enq"]
+        t_enq = event_time(enq)
         found = None
         for step in steps:
             if step["t_start"] <= t_enq < step["t_end_next"]:
@@ -260,7 +407,8 @@ def _regime_at_enq(reqs):
     return "pure_decode"
 
 
-def replay(steps, enq_events, traces, meta, coeffs, estimator_name, use_oracle, load_of):
+def replay(steps, enq_events, traces, meta, coeffs, estimator_name, use_oracle,
+           load_of, include_censored=False):
     """Run estimator `estimator_name` on every non-censored, bucketed,
     ACTUALLY-SCHEDULED request's reconstructed enqueue-time context, and
     compare its prediction against the realized admission delay.
@@ -281,10 +429,15 @@ def replay(steps, enq_events, traces, meta, coeffs, estimator_name, use_oracle, 
     harness targets -- has no `traces` entry and therefore no `t_sched`,
     so its realized T_adm is undefined. Such requests are excluded from
     `rows` and counted in `never_scheduled_count` instead of raising.
-    Requests that ARE in `traces` but run past capture end (`censored`)
-    are still excluded from `rows` as before, but are NOT counted as
-    never-scheduled (they were scheduled; only their departure is
-    unobserved).
+    Requests that ARE in `traces` but run past capture end (`censored`) are
+    normally excluded because their output length is incomplete.  If
+    ``include_censored`` is true for a deployable replay, they are included:
+    admission is already exactly observed, and callers may also have observed
+    their first-token instant even though departure is absent.  The deployable
+    estimate never uses the target's eventual output length.  Never-scheduled
+    requests are also predicted and emitted with ``right_censored=True`` and a
+    realized lower bound; they carry no exact realized value and remain
+    ineligible for MAPE.
     """
     estimator = ESTIMATORS[estimator_name]
     bucket, _dropped = enqueue_bucket(steps, enq_events)
@@ -305,10 +458,13 @@ def replay(steps, enq_events, traces, meta, coeffs, estimator_name, use_oracle, 
     for rid in bucket:
         if rid not in traces:
             never_scheduled += 1  # enqueued + bucketed but never scheduled (still waiting)
+            if include_censored and not use_oracle:
+                req_ids.append(rid)
             continue
-        if not traces[rid]["censored"]:
+        if (not traces[rid]["censored"]
+                or (include_censored and not use_oracle)):
             req_ids.append(rid)
-    req_ids.sort(key=lambda rid: enq_events[rid]["t_enq"])
+    req_ids.sort(key=lambda rid: event_time(enq_events[rid]))
 
     running_mean = RunningMean()
     comp_i = 0
@@ -317,9 +473,10 @@ def replay(steps, enq_events, traces, meta, coeffs, estimator_name, use_oracle, 
         enq = enq_events[req_id]
         step = bucket[req_id]
         step_idx = idx_of[id(step)]
-        t_enq = enq["t_enq"]
+        t_enq = event_time(enq)
         reqs = step["reqs"]
 
+        output_len_est = None
         if use_oracle:
             if reqs:
                 nout_est = max(1.0, sum(
@@ -330,29 +487,85 @@ def replay(steps, enq_events, traces, meta, coeffs, estimator_name, use_oracle, 
             while comp_i < len(completions) and completions[comp_i][0] < t_enq:
                 running_mean.add(completions[comp_i][1])
                 comp_i += 1
-            nout_est = deployable_rem_steps_est(step, running_mean.value())
+            output_len_est = running_mean.value()
+            nout_est = deployable_rem_steps_est(step, output_len_est)
 
         ctx = build_context(step, step_idx, req_id, enq, meta, coeffs, traces,
-                             use_oracle, nout_est)
-        predicted = estimator(ctx)
-        realized = traces[req_id]["t_sched"] - t_enq
-        ratio = (realized / predicted) if predicted > 0 else None
-        rows.append({
+                            use_oracle, nout_est, enq_events=enq_events,
+                            output_len_est=output_len_est)
+        if estimator_name == "token_rollforward":
+            predicted, predicted_first_token = estimate_token_rollforward_times(ctx)
+        else:
+            predicted = estimator(ctx)
+            predicted_first_token = None
+        right_censored = req_id not in traces
+        realized = (None if right_censored
+                    else traces[req_id]["t_sched"] - t_enq)
+        ratio = (realized / predicted
+                 if realized is not None and predicted > 0 else None)
+        row = {
             "req_id": req_id,
             "predicted": predicted,
             "realized": realized,
             "ratio": ratio,
             "load_bin": load_of(req_id),
             "regime_at_enq": _regime_at_enq(reqs),
-        })
+            "t_engine_arrive": enq.get("t_engine_arrive"),
+            "t_enq": enq["t_enq"],
+            "engine_input_wait": enq.get("engine_input_wait"),
+            "right_censored": right_censored,
+        }
+        if predicted_first_token is not None:
+            row["predicted_first_token"] = predicted_first_token
+        if right_censored:
+            lower_bound = max(steps[-1]["t_end_next"] - t_enq, 0.0)
+            row["lower_bound"] = lower_bound
+            row["prediction_below_lower_bound"] = predicted < lower_bound
+            row["known_underprediction_lower_bound"] = max(
+                lower_bound - predicted, 0.0)
+        rows.append(row)
     return rows, never_scheduled
+
+
+def admission_censored_rows(steps, enq_events, traces, load_of,
+                            predictions=None):
+    """Right-censored admission observations for requests never scheduled.
+
+    Each row says only that ``T_adm`` exceeded ``lower_bound`` at capture end;
+    it must not be folded into MAPE as though the bound were the realized wait.
+    """
+    bucket, _ = enqueue_bucket(steps, enq_events)
+    if not steps:
+        return []
+    capture_end = steps[-1]["t_end_next"]
+    rows = []
+    for rid, step in bucket.items():
+        if rid in traces:
+            continue
+        arrival = event_time(enq_events[rid])
+        row = {
+            "req_id": rid,
+            "lower_bound": max(capture_end - arrival, 0.0),
+            "arrival": arrival,
+            "capture_end": capture_end,
+            "load_bin": load_of(rid),
+            "regime_at_enq": _regime_at_enq(step["reqs"]),
+        }
+        if predictions is not None and rid in predictions:
+            predicted = predictions[rid]
+            row["predicted"] = predicted
+            row["prediction_below_lower_bound"] = predicted < row["lower_bound"]
+            row["known_underprediction_lower_bound"] = max(
+                row["lower_bound"] - predicted, 0.0)
+        rows.append(row)
+    return rows
 
 
 def _load_section(load_bin):
     return "overload" if "overload" in str(load_bin) else "sub_capacity"
 
 
-def admission_report(rows_by_key, diag_rows=None):
+def admission_report(rows_by_key, diag_rows=None, censored_rows=None):
     """Aggregate replay rows into a report dict.
 
     rows_by_key: {(estimator, variant): [row, ...]} -- the `rows` element of
@@ -382,12 +595,26 @@ def admission_report(rows_by_key, diag_rows=None):
             median_ratio = statistics.median(ratios) if ratios else None
             errs = [abs(r["predicted"] - r["realized"]) / r["realized"]
                     for r in bin_rows if r.get("realized")]
+            abs_errs = [abs(r["predicted"] - r["realized"])
+                        for r in bin_rows if r.get("realized")]
+            sorted_errs = sorted(errs)
+            realized_sum = sum(r["realized"] for r in bin_rows
+                               if r.get("realized"))
             mape = (sum(errs) / len(errs) * 100.0) if errs else None
             bias_pct = ((median_ratio - 1) * 100.0) if median_ratio is not None else None
             section = _load_section(load_bin)
             section_dict = report[section]
             section_dict.setdefault(estimator, {}).setdefault(variant, {})[load_bin] = {
-                "n": n, "median_ratio": median_ratio, "mape": mape, "bias_pct": bias_pct,
+                "n": n, "median_ratio": median_ratio, "mape": mape,
+                "median_ape": (statistics.median(errs) * 100.0 if errs else None),
+                "p90_ape": (sorted_errs[min(int(0.9 * len(sorted_errs)),
+                                             len(sorted_errs) - 1)] * 100.0
+                            if sorted_errs else None),
+                "mae_ms": (sum(abs_errs) / len(abs_errs) * 1000.0
+                           if abs_errs else None),
+                "wape": (sum(abs_errs) / realized_sum * 100.0
+                         if realized_sum > 0 else None),
+                "bias_pct": bias_pct,
             }
 
     if diag_rows:
@@ -398,6 +625,38 @@ def admission_report(rows_by_key, diag_rows=None):
         "n": len(deltas),
         "mean_abs_delta": (sum(deltas) / len(deltas)) if deltas else None,
         "max_abs_delta": max(deltas) if deltas else None,
+    }
+    censored_rows = censored_rows or []
+    lower_bounds = sorted(r["lower_bound"] for r in censored_rows)
+    predicted_censored = [r for r in censored_rows if r.get("predicted") is not None]
+    known_shortfalls = sorted(
+        r.get("known_underprediction_lower_bound", 0.0)
+        for r in predicted_censored)
+    violations = sum(bool(r.get("prediction_below_lower_bound"))
+                     for r in predicted_censored)
+    report["right_censored"] = {
+        "n": len(censored_rows),
+        "lower_bound_s_p50": (statistics.median(lower_bounds)
+                              if lower_bounds else None),
+        "lower_bound_s_p90": (lower_bounds[min(
+            int(0.9 * len(lower_bounds)), len(lower_bounds) - 1)]
+                              if lower_bounds else None),
+        "by_load_bin": {
+            name: sum(1 for r in censored_rows if r["load_bin"] == name)
+            for name in sorted({r["load_bin"] for r in censored_rows})
+        },
+        "prediction_n": len(predicted_censored),
+        "prediction_below_lower_bound_n": violations,
+        "prediction_below_lower_bound_frac": (
+            violations / len(predicted_censored) if predicted_censored else None),
+        "known_underprediction_s_p50": (
+            statistics.median(known_shortfalls) if known_shortfalls else None),
+        "known_underprediction_s_p90": (
+            known_shortfalls[min(int(0.9 * len(known_shortfalls)),
+                                 len(known_shortfalls) - 1)]
+            if known_shortfalls else None),
+        "note": ("right-censored; lower bounds are not included in MAPE. "
+                 "A prediction below its lower bound is a proven underprediction."),
     }
     return report
 

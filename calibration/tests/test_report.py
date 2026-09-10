@@ -1,5 +1,5 @@
 import csv, math, json, os
-from calibration.report import run_report
+from calibration.report import load_csv_inputs, run_report
 
 def _write(path, header, rows):
     with open(path, "w", newline="") as f:
@@ -32,3 +32,14 @@ def test_run_report_end_to_end(tmp_path):
     assert os.path.exists(d/"predicted_vs_realized.png")
     coeffs = json.load(open(d/"coeffs.json"))
     assert abs(coeffs["c_attn"] - c_attn) < 1e-11
+
+
+def test_load_csv_inputs_accepts_multiple_shards(tmp_path):
+    header = ["B", "n", "k", "t_iter"]
+    _write(tmp_path / "first.csv", header, [(1, 64, 4, 0.1)])
+    _write(tmp_path / "second.csv", header, [(2, 256, 8, 0.2)])
+
+    assert load_csv_inputs([
+        tmp_path / "first.csv",
+        tmp_path / "second.csv",
+    ]) == [(1.0, 64.0, 4.0, 0.1), (2.0, 256.0, 8.0, 0.2)]
