@@ -1,0 +1,129 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-cal-llama70b-v026-internal
+  namespace: vramani-perfcal
+  annotations:
+    calibration.llm-d.ai/vllm-source-commit: 568afb3a13806beb53bb2e6bd518269357b237c0
+    calibration.llm-d.ai/vllm-image-digest: sha256:770fe65b2c73ee74a5c42165cf3433de4048cc2cd9c57a937ca4e35aba5aa87b
+  labels:
+    app: vllm-cal-llama70b-v026-internal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-cal-llama70b-v026-internal
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: vllm-cal-llama70b-v026-internal
+        calibration.llm-d.ai/owner: vramani
+        calibration.llm-d.ai/mode: internal-trace
+    spec:
+      terminationGracePeriodSeconds: 120
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+      containers:
+        - name: server
+          image: docker.io/vllm/vllm-openai@sha256:770fe65b2c73ee74a5c42165cf3433de4048cc2cd9c57a937ca4e35aba5aa87b
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              vllm serve meta-llama/Llama-3.3-70B-Instruct
+              --revision 6f6073b423013f6a7d4d9f39144961bfbfbc386b
+              --tensor-parallel-size 4
+              --block-size 16
+              --max-model-len 32768
+              --max-num-seqs 128
+              --max-num-batched-tokens 8192
+              --enable-chunked-prefill
+              --no-enable-prefix-caching
+              --gpu-memory-utilization 0.92
+              --seed 0
+              --download-dir /models-cache
+          env:
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: token
+            - name: HOME
+              value: /models-cache
+            - name: USER
+              value: vllm
+            - name: TORCHINDUCTOR_CACHE_DIR
+              value: /tmp/torchinductor
+            - name: VLLM_CACHE_ROOT
+              value: /tmp/vllm
+            - name: VLLM_PORT
+              value: "8000"
+            - name: PYTHONPATH
+              value: /opt/internal-trace
+            - name: ITERTRACE_OUT_DIR
+              value: /results/llama3.3-70b-tp4-vllm-0.26.0/internal-v1
+          resources:
+            limits:
+              cpu: "32"
+              memory: 128Gi
+              nvidia.com/gpu: "4"
+            requests:
+              cpu: "16"
+              memory: 64Gi
+              nvidia.com/gpu: "4"
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+            failureThreshold: 120
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          volumeMounts:
+            - name: models-cache
+              mountPath: /models-cache
+            - name: shm
+              mountPath: /dev/shm
+            - name: internal-trace-hook
+              mountPath: /opt/internal-trace
+            - name: results
+              mountPath: /results
+      volumes:
+        - name: models-cache
+          persistentVolumeClaim:
+            claimName: model-cache-70b
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: internal-trace-hook
+          configMap:
+            name: internal-trace-v026-hook
+        - name: results
+          persistentVolumeClaim:
+            claimName: cal-results-pvc
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-cal-llama70b-v026-internal
+  namespace: vramani-perfcal
+spec:
+  selector:
+    app: vllm-cal-llama70b-v026-internal
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000

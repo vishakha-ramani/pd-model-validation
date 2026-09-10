@@ -108,12 +108,14 @@ def streamed_token_count(choice):
     return int(bool(choice.get("text")))
 
 
-async def _stream_tokens(client, base_url, model, prompt, max_tokens):
+async def _stream_tokens(client, base_url, model, prompt, max_tokens, request_id=None):
     # returns list of absolute timestamps, one per streamed token
     ts = []
     payload = {"model": model, "prompt": prompt, "max_tokens": max_tokens,
                "stream": True, "ignore_eos": True, "temperature": 0.0,
                "return_token_ids": True}
+    if request_id is not None:
+        payload["request_id"] = request_id
     async with client.stream("POST", f"{base_url}/v1/completions", json=payload) as r:
         async for line in r.aiter_lines():
             if not line.startswith("data:"):
@@ -130,20 +132,32 @@ async def _stream_tokens(client, base_url, model, prompt, max_tokens):
     return ts
 
 
-async def run_decode(base_url, model, B, n, max_tokens, rng, warmup=4):
+async def run_decode(base_url, model, B, n, max_tokens, rng, warmup=4,
+                     request_prefix=None):
     async with httpx.AsyncClient(timeout=None) as client:
         prompts = [random_prompt(n, rng) for _ in range(B)]
         streams = await asyncio.gather(*[
-            _stream_tokens(client, base_url, model, p, max_tokens) for p in prompts])
+            _stream_tokens(
+                client,
+                base_url,
+                model,
+                prompt,
+                max_tokens,
+                request_id=(f"{request_prefix}:r{index}" if request_prefix else None),
+            )
+            for index, prompt in enumerate(prompts)
+        ])
     steps = steady_decode_steps(streams, warmup)
     return [(B, n, k, dt) for (k, dt) in steps if not math.isnan(dt)]
 
 
-async def run_prefill(base_url, model, n, rng):
+async def run_prefill(base_url, model, n, rng, request_id=None):
     async with httpx.AsyncClient(timeout=None) as client:
         prompt = random_prompt(n, rng)
         t0 = time.perf_counter()
-        ts = await _stream_tokens(client, base_url, model, prompt, max_tokens=1)
+        ts = await _stream_tokens(
+            client, base_url, model, prompt, max_tokens=1, request_id=request_id
+        )
     if not ts:
         return None  # no token returned; caller skips this cell rather than crashing the sweep
     ttft = ts[0] - t0
@@ -191,7 +205,7 @@ def align_injection_window(streams, t_fire, t_first, n_inject, chunk_bud, B, n_d
 
 
 async def run_mixed(base_url, model, B, n_decode, n_inject, max_tokens, chunk_bud, rng,
-                    warmup_s=1.0, debug_rows=None, repeat=0):
+                    warmup_s=1.0, debug_rows=None, repeat=0, request_prefix=None):
     # Hold B decode streams steady, then inject one long-prompt request. Its prefill spans
     # ceil(n_inject/chunk_bud) engine iterations; during that window the resident decode
     # streams' inter-token latency inflates. We timestamp the injection window
@@ -199,12 +213,25 @@ async def run_mixed(base_url, model, B, n_decode, n_inject, max_tokens, chunk_bu
     # order to prefill chunks. MAPE is therefore computed only over the injection window.
     async with httpx.AsyncClient(timeout=None) as client:
         decode_prompts = [random_prompt(n_decode, rng) for _ in range(B)]
-        decode_tasks = [asyncio.create_task(
-            _stream_tokens(client, base_url, model, p, max_tokens)) for p in decode_prompts]
+        decode_tasks = [asyncio.create_task(_stream_tokens(
+            client,
+            base_url,
+            model,
+            prompt,
+            max_tokens,
+            request_id=(f"{request_prefix}:decode:r{index}" if request_prefix else None),
+        )) for index, prompt in enumerate(decode_prompts)]
         await asyncio.sleep(warmup_s)  # let decode streams reach steady state
         inject_prompt = random_prompt(n_inject, rng)
         t_fire = time.perf_counter()
-        inject_ts = await _stream_tokens(client, base_url, model, inject_prompt, max_tokens=1)
+        inject_ts = await _stream_tokens(
+            client,
+            base_url,
+            model,
+            inject_prompt,
+            max_tokens=1,
+            request_id=(f"{request_prefix}:prefill" if request_prefix else None),
+        )
         streams = await asyncio.gather(*decode_tasks)
     if not inject_ts:
         return []  # injected request produced no token; cell invalid
@@ -234,6 +261,8 @@ async def main():
     result_dir = os.environ.get("RESULT_DIR", "/results")
     os.makedirs(result_dir, exist_ok=True)
     rng = random.Random(int(os.environ.get("SEED", "0")))
+    seed = int(os.environ.get("SEED", "0"))
+    request_prefix = os.environ.get("REQUEST_PREFIX", f"cal:s{seed}")
 
     decode_batches = env_int_list("DECODE_BATCHES", [1, 2, 4, 8, 16, 32, 64])
     decode_contexts = env_int_list("DECODE_CONTEXTS", [64, 256, 1024, 4096])
@@ -252,7 +281,8 @@ async def main():
 
     metadata = {
         "model": model,
-        "seed": int(os.environ.get("SEED", "0")),
+        "seed": seed,
+        "request_prefix": request_prefix,
         "chunk_bud": chunk_bud,
         "decode_batches": decode_batches,
         "decode_contexts": decode_contexts,
@@ -275,7 +305,13 @@ async def main():
     for B in decode_batches:
         for n in decode_contexts:
             decode_rows += await run_decode(
-                base, model, B, n, max_tokens=decode_max_tokens, rng=rng
+                base,
+                model,
+                B,
+                n,
+                max_tokens=decode_max_tokens,
+                rng=rng,
+                request_prefix=f"{request_prefix}:decode:B{B}:N{n}",
             )
     write_csv(
         os.path.join(result_dir, "decode.csv"),
@@ -285,8 +321,14 @@ async def main():
 
     prefill_rows = []
     for n in prefill_lengths:
-        for _ in range(prefill_repeats):
-            r = await run_prefill(base, model, n, rng)
+        for repeat in range(prefill_repeats):
+            r = await run_prefill(
+                base,
+                model,
+                n,
+                rng,
+                request_id=f"{request_prefix}:prefill:N{n}:r{repeat}",
+            )
             if r is not None:
                 prefill_rows.append(r)
     write_csv(
@@ -308,6 +350,7 @@ async def main():
                 rng=rng,
                 debug_rows=mixed_debug_rows,
                 repeat=repeat,
+                request_prefix=f"{request_prefix}:mixed:B{B}:r{repeat}",
             )
     write_csv(
         os.path.join(result_dir, "mixed.csv"),
