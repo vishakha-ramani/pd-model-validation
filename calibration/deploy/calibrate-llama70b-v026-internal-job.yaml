@@ -37,8 +37,10 @@ spec:
               export SEED="${JOB_COMPLETION_INDEX}";
               export REQUEST_PREFIX="internal-v1:s${JOB_COMPLETION_INDEX}";
               export RESULT_DIR="/results/llama3.3-70b-tp4-vllm-0.26.0/internal-v1/client/replicate-${JOB_COMPLETION_INDEX}";
+              python /code/preflight.py;
               pip install --no-cache-dir httpx;
-              python /code/client.py
+              python /code/client.py;
+              python /code/preflight.py
           env:
             - name: HOME
               value: /tmp
